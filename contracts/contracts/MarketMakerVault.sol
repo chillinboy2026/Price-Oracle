@@ -64,6 +64,13 @@ contract MarketMakerVault is AccessControl, Pausable, ReentrancyGuard {
         // the pricing engine consumes. Longer means only more sustained
         // positioning can influence price. 0 disables smoothing.
         uint32 skewSmoothingWindow;
+        // Converts smoothed skew into a funding rate: rate/day =
+        // smoothedSkew * fundingCoefficientBps / BPS. 0 disables funding.
+        uint16 fundingCoefficientBps;
+        // Ceiling on the magnitude of the daily funding rate, in bps of
+        // notional. Bounds the carry cost so a position cannot be drained by
+        // an extreme skew reading.
+        uint16 maxFundingRateBpsPerDay;
     }
 
     VaultConfig public config;
@@ -85,6 +92,12 @@ contract MarketMakerVault is AccessControl, Pausable, ReentrancyGuard {
     int256 public smoothedSkewBps; // time-smoothed demand signal; see getSmoothedSkewBps
     uint256 public lastSkewUpdateAt;
 
+    /// @notice Running sum of funding rate x elapsed time, in bps of notional.
+    /// Positive means longs have paid shorts on net since deployment.
+    /// Positions record this at open and settle the difference at close, which
+    /// makes funding O(1) per position rather than requiring any iteration.
+    int256 public cumulativeFundingBps;
+
     struct Position {
         address trader;
         bool isLong;
@@ -92,6 +105,7 @@ contract MarketMakerVault is AccessControl, Pausable, ReentrancyGuard {
         uint256 notional; // margin * leverage
         uint256 entryPrice;
         uint256 reserved; // MM capital earmarked for this position's max payout
+        int256 entryFundingBps; // cumulativeFundingBps when this position opened
         bool open;
     }
 
@@ -172,6 +186,11 @@ contract MarketMakerVault is AccessControl, Pausable, ReentrancyGuard {
         if (_config.maintenanceMarginBps == 0 || _config.maintenanceMarginBps >= BPS_DENOMINATOR) revert InvalidConfig();
         if (_config.liquidatorShareBps > BPS_DENOMINATOR) revert InvalidConfig();
         if (_config.maxFeeBps > BPS_DENOMINATOR || _config.baseFeeBps > _config.maxFeeBps) revert InvalidConfig();
+        // A daily funding rate at or above 100% of notional could wipe a
+        // position's entire margin inside a day at 1x, which is a liquidation
+        // engine masquerading as a carry cost.
+        if (_config.maxFundingRateBpsPerDay >= BPS_DENOMINATOR) revert InvalidConfig();
+        if (_config.fundingCoefficientBps != 0 && _config.maxFundingRateBpsPerDay == 0) revert InvalidConfig();
         // A position opened at max leverage must not be instantly liquidatable:
         // its opening equity (margin) has to exceed notional * maintenanceMargin.
         if (uint256(_config.maxLeverageBps) * _config.maintenanceMarginBps >= BPS_DENOMINATOR * BPS_DENOMINATOR) {
@@ -197,7 +216,7 @@ contract MarketMakerVault is AccessControl, Pausable, ReentrancyGuard {
         if (amount == 0) revert ZeroAmount();
         // Skew is measured relative to liquidity, so changing liquidity changes
         // it even with no trade; bank the old level first.
-        _accrueSmoothedSkew();
+        _accrue();
         quoteToken.safeTransferFrom(msg.sender, address(this), amount);
         totalLiquidity += amount;
         emit LiquidityDeposited(msg.sender, amount);
@@ -207,7 +226,7 @@ contract MarketMakerVault is AccessControl, Pausable, ReentrancyGuard {
         if (amount == 0) revert ZeroAmount();
         uint256 available = availableLiquidity();
         if (amount > available) revert InsufficientAvailableLiquidity(amount, available);
-        _accrueSmoothedSkew();
+        _accrue();
         totalLiquidity -= amount;
         quoteToken.safeTransfer(msg.sender, amount);
         emit LiquidityWithdrawn(msg.sender, amount);
@@ -289,20 +308,90 @@ contract MarketMakerVault is AccessControl, Pausable, ReentrancyGuard {
         return smoothedSkewBps + ((current - smoothedSkewBps) * weight) / int256(BPS_DENOMINATOR);
     }
 
-    /// @dev Folds elapsed time into the stored smoothed skew. Called before any
-    /// change to `netNotional` or `totalLiquidity`, so the average always
-    /// reflects the skew that actually prevailed over each interval rather than
+    // ---------------------------------------------------------------------
+    // Funding
+    // ---------------------------------------------------------------------
+
+    /// @notice Daily funding rate implied by a given skew, in bps of notional,
+    /// clamped to `maxFundingRateBpsPerDay`. Positive means longs pay.
+    function fundingRateForSkew(int256 skewBps) public view returns (int256) {
+        if (config.fundingCoefficientBps == 0) return 0;
+
+        int256 rate = (skewBps * int256(uint256(config.fundingCoefficientBps))) / int256(BPS_DENOMINATOR);
+        int256 cap = int256(uint256(config.maxFundingRateBpsPerDay));
+        if (rate > cap) return cap;
+        if (rate < -cap) return -cap;
+        return rate;
+    }
+
+    /// @notice The rate that will accrue going forward, based on skew as of now.
+    function currentFundingRateBpsPerDay() external view returns (int256) {
+        return fundingRateForSkew(getSmoothedSkewBps());
+    }
+
+    /// @notice `cumulativeFundingBps` brought up to `block.timestamp`.
+    ///
+    /// The interval is charged at the rate implied by the skew as of *now*,
+    /// which is a first-order approximation -- the exact figure would integrate
+    /// a continuously-moving rate. Using the current value rather than the one
+    /// stored at the interval's start matters: `_accrue()` runs immediately
+    /// *before* any trade mutates `netNotional`, so the stored value is always
+    /// the pre-trade skew, and pricing the forward interval off it would charge
+    /// a freshly-opened imbalance nothing at all until the next interaction.
+    ///
+    /// Ramp-in still happens where it should. With smoothing enabled,
+    /// `getSmoothedSkewBps()` itself climbs gradually toward the new level, so
+    /// a position opened moments ago is not charged as though its imbalance had
+    /// existed all along. Frequent `poke()` calls tighten the approximation.
+    function cumulativeFundingBpsNow() public view returns (int256) {
+        if (lastSkewUpdateAt == 0) return cumulativeFundingBps;
+        uint256 elapsed = block.timestamp - lastSkewUpdateAt;
+        if (elapsed == 0) return cumulativeFundingBps;
+
+        int256 rate = fundingRateForSkew(getSmoothedSkewBps());
+        return cumulativeFundingBps + (rate * int256(elapsed)) / int256(1 days);
+    }
+
+    /// @notice Funding this position owes right now, in quote token. Positive
+    /// means the trader pays; negative means they receive.
+    ///
+    /// This is what makes a crowded position expensive to *hold* rather than
+    /// merely capped in its price influence. The displacement cap bounds how
+    /// far sentiment can move the mark; funding bounds how long anyone is
+    /// willing to fund the position doing the pushing.
+    function fundingOwed(uint256 positionId) public view returns (int256) {
+        Position memory position = positions[positionId];
+        if (!position.open) return 0;
+
+        int256 delta = cumulativeFundingBpsNow() - position.entryFundingBps;
+        int256 owed = (int256(position.notional) * delta) / int256(BPS_DENOMINATOR);
+        return position.isLong ? owed : -owed;
+    }
+
+    /// @dev Folds elapsed time into both the funding index and the smoothed
+    /// skew. Called before any change to `netNotional` or `totalLiquidity`, so
+    /// each is credited for the interval that actually prevailed rather than
     /// jumping to the post-trade value retroactively.
-    function _accrueSmoothedSkew() internal {
+    ///
+    /// Order matters: funding is charged for the elapsed interval *before* the
+    /// skew is advanced, so the interval is priced at the skew that held during
+    /// it rather than at the one that only just arrived.
+    function _accrue() internal {
+        cumulativeFundingBps = cumulativeFundingBpsNow();
         smoothedSkewBps = getSmoothedSkewBps();
         lastSkewUpdateAt = block.timestamp;
     }
 
-    /// @notice Advances the smoothed skew without trading. Permissionless: an
-    /// asset can sit untraded for long stretches, and without this the stored
-    /// value would only ever update on the next trade.
+    /// @notice Advances funding and smoothed skew without trading.
+    /// Permissionless: an asset can sit untraded for long stretches, and
+    /// without this neither would update until the next trade.
+    function poke() public {
+        _accrue();
+    }
+
+    /// @notice Backwards-compatible alias for `poke()`.
     function pokeSkew() external {
-        _accrueSmoothedSkew();
+        poke();
     }
 
     /// @notice Fee (in bps of notional) a trade in direction `isLong` would pay
@@ -335,12 +424,18 @@ contract MarketMakerVault is AccessControl, Pausable, ReentrancyGuard {
         return (int256(position.notional) * delta) / int256(position.entryPrice);
     }
 
-    /// @notice Position equity (margin + unrealized pnl) at `price`. Can be
-    /// negative if a price move outran liquidation.
+    /// @notice Position equity at `price`: margin, plus unrealized pnl, less
+    /// funding accrued so far. Can be negative if a price move outran
+    /// liquidation.
+    ///
+    /// Funding counts here deliberately. A position on the crowded side bleeds
+    /// equity for as long as it stays there, drifting toward liquidation even
+    /// with price unchanged. That is the whole point of funding: it converts a
+    /// standing imbalance into a running cost rather than a free option.
     function getPositionEquityAt(uint256 positionId, uint256 price) public view returns (int256) {
         Position memory position = positions[positionId];
         if (!position.open) revert PositionNotOpen(positionId);
-        return int256(position.margin) + _pnlAt(position, price);
+        return int256(position.margin) + _pnlAt(position, price) - fundingOwed(positionId);
     }
 
     function getPositionEquity(uint256 positionId) public view returns (int256) {
@@ -354,27 +449,34 @@ contract MarketMakerVault is AccessControl, Pausable, ReentrancyGuard {
     function isLiquidatable(uint256 positionId) public view returns (bool) {
         Position memory position = positions[positionId];
         if (!position.open) return false;
-        int256 equity = int256(position.margin) + _pnlAt(position, getMarkPrice());
+        int256 equity = int256(position.margin) + _pnlAt(position, getMarkPrice()) - fundingOwed(positionId);
         return equity < int256(maintenanceMarginFor(positionId));
     }
 
-    /// @notice Price at which this position becomes liquidatable. Derived from
-    /// equity == maintenance margin:
-    ///   long:  P = entry * (1 + mmBps/BPS - margin/notional)
-    ///   short: P = entry * (1 - mmBps/BPS + margin/notional)
-    /// Returns 0 for a long that can never be liquidated before price hits zero.
+    /// @notice Price at which this position becomes liquidatable, given funding
+    /// accrued to date. Derived from equity == maintenance margin, with
+    /// `effectiveMargin = margin - fundingOwed`:
+    ///   long:  P = entry * (1 + mmBps/BPS - effectiveMargin/notional)
+    ///   short: P = entry * (1 - mmBps/BPS + effectiveMargin/notional)
+    ///
+    /// Note this moves as funding accrues: a long on the crowded side sees its
+    /// liquidation price creep upward toward the mark over time even if the
+    /// mark never moves.
+    /// Returns 0 for a long that cannot be liquidated before price hits zero.
     function getLiquidationPrice(uint256 positionId) external view returns (uint256) {
         Position memory position = positions[positionId];
         if (!position.open) revert PositionNotOpen(positionId);
 
-        uint256 marginRatioBps = (position.margin * BPS_DENOMINATOR) / position.notional;
-        uint256 mmBps = config.maintenanceMarginBps;
+        int256 effectiveMargin = int256(position.margin) - fundingOwed(positionId);
+        int256 marginRatioBps = (effectiveMargin * int256(BPS_DENOMINATOR)) / int256(position.notional);
+        int256 mmBps = int256(uint256(config.maintenanceMarginBps));
 
-        if (position.isLong) {
-            if (marginRatioBps >= BPS_DENOMINATOR + mmBps) return 0;
-            return (position.entryPrice * (BPS_DENOMINATOR + mmBps - marginRatioBps)) / BPS_DENOMINATOR;
-        }
-        return (position.entryPrice * (BPS_DENOMINATOR + marginRatioBps - mmBps)) / BPS_DENOMINATOR;
+        int256 factorBps = position.isLong
+            ? int256(BPS_DENOMINATOR) + mmBps - marginRatioBps
+            : int256(BPS_DENOMINATOR) - mmBps + marginRatioBps;
+
+        if (factorBps <= 0) return 0;
+        return (position.entryPrice * uint256(factorBps)) / BPS_DENOMINATOR;
     }
 
     // ---------------------------------------------------------------------
@@ -420,7 +522,7 @@ contract MarketMakerVault is AccessControl, Pausable, ReentrancyGuard {
         if (reserve > available) revert InsufficientAvailableLiquidity(reserve, available);
 
         // Bank the pre-trade skew before this position changes it.
-        _accrueSmoothedSkew();
+        _accrue();
 
         feesAccrued += fee;
         totalMargin += netMargin;
@@ -434,6 +536,9 @@ contract MarketMakerVault is AccessControl, Pausable, ReentrancyGuard {
             notional: notional,
             entryPrice: entryPrice,
             reserved: reserve,
+            // Snapshot taken after _accrue(), so this position is charged only
+            // for funding that accrues from now on.
+            entryFundingBps: cumulativeFundingBps,
             open: true
         });
 
@@ -451,7 +556,13 @@ contract MarketMakerVault is AccessControl, Pausable, ReentrancyGuard {
 
         uint256 exitPrice = getMarkPrice();
         int256 pnl = _pnlAt(position, exitPrice);
-        int256 equityBeforeFee = int256(position.margin) + pnl;
+        // Settle funding at the same instant as pnl. Because it flows through
+        // `residual`, the money movement needs no separate bookkeeping: what a
+        // long pays lands in totalLiquidity, what a short receives comes out of
+        // it, and the difference -- netNotional x rate -- accrues to the market
+        // maker, who is the residual counterparty carrying that net exposure.
+        int256 funding = fundingOwed(positionId);
+        int256 equityBeforeFee = int256(position.margin) + pnl - funding;
 
         // The payout ceiling is applied to the position's whole residual value
         // before the fee is carved out of it, so the MM's share of the outflow
@@ -496,7 +607,9 @@ contract MarketMakerVault is AccessControl, Pausable, ReentrancyGuard {
 
         uint256 markPrice = getMarkPrice();
         int256 pnl = _pnlAt(position, markPrice);
-        int256 equity = int256(position.margin) + pnl;
+        // Accrued funding is part of what made this position liquidatable, so
+        // it settles here on the same terms as pnl.
+        int256 equity = int256(position.margin) + pnl - fundingOwed(positionId);
 
         uint256 maintenance = (position.notional * config.maintenanceMarginBps) / BPS_DENOMINATOR;
         if (equity >= int256(maintenance)) revert PositionNotLiquidatable(positionId);
@@ -542,7 +655,7 @@ contract MarketMakerVault is AccessControl, Pausable, ReentrancyGuard {
         // Bank the skew that prevailed up to this instant before unwinding the
         // position, so the smoothed average credits the period the exposure was
         // actually open rather than retroactively erasing it.
-        _accrueSmoothedSkew();
+        _accrue();
         positions[positionId].open = false;
         reservedLiquidity -= position.reserved;
         netNotional -= position.isLong ? int256(position.notional) : -int256(position.notional);

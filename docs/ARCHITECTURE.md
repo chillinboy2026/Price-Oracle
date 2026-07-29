@@ -177,6 +177,53 @@ stops *new* risk from being opened, but blocking liquidations would strand
 the market maker holding undercollateralized exposure -- precisely the
 situation pausing exists to contain.
 
+#### Funding: making a crowded position expensive to hold
+
+The displacement cap bounds *how far* sentiment can move the mark. Funding
+bounds *how long anyone is willing to pay for it*. Without funding a large
+one-sided position is a free option: pay the entry fee once, then hold the mark
+displaced indefinitely at no further cost.
+
+The rate is driven by the same smoothed skew the price displacement uses —
+consistent, and anti-gaming, since you cannot open just before a snapshot:
+
+```
+rate/day  = clamp(smoothedSkew × fundingCoefficientBps / BPS, ±maxFundingRateBpsPerDay)
+owed      = notional × (cumulativeFundingNow − entryFunding) / BPS   [sign by direction]
+```
+
+Settlement uses a **cumulative index**, so funding is O(1) per position rather
+than requiring any iteration: each position records `cumulativeFundingBps` at
+open and settles the difference at close or liquidation.
+
+**Where the money goes falls out of the accounting.** Funding enters through
+the position's `residual`, so what a long pays lands in `totalLiquidity`, what
+a short receives comes out of it, and the difference — `netNotional × rate` —
+accrues to the market maker. No explicit split is needed, and the result is the
+economically correct one: the balancing side is paid to be there, and the MM is
+compensated for carrying the net exposure nobody else would take.
+
+**Funding counts against equity**, so a position on the crowded side bleeds
+toward liquidation even with the price unchanged, and `getLiquidationPrice()`
+walks toward the mark as carry accrues. That is deliberate: a standing
+imbalance should be a running cost, not a free option.
+
+The rate is capped so funding stays a carry cost rather than becoming a second
+liquidation engine. Past the cap, extra crowding raises the total bill only
+through position size, not through the rate.
+
+`pnpm --filter ./offchain demo:funding` prices this out. Against a $10m pool,
+holding the mark ~4.5% above centre requires roughly $3.1m of net one-sided
+notional and costs about $63k/day — and the carry exceeds the entire round-trip
+entry fee within a single day. Pushing to 8.55% costs ~$140k/day, and the ±9%
+cap is unreachable at any finite cost, since displacement approaches it
+asymptotically.
+
+Funding raises the cost of manipulation; it does not make it impossible. An
+actor who values a displaced mark more than the carry will still pay. And the
+figures scale with pool size — a thinly-funded vault is cheap to push, because
+the same skew needs less absolute notional.
+
 #### Gap risk, and why the oracle guardrail matters here
 
 If price moves far enough in one step that equity goes negative before a
@@ -580,6 +627,7 @@ more one-sided the book becomes.
 | One-sided trading flow against the vault | Inventory-skewed taker fee, oracle mid never touched |
 | Spiking the mark with a brief large position | Skew is smoothed on-chain over a window, so only sustained positioning is visible |
 | Sentiment overwhelming real-world evidence | Displacement capped at a fixed share of the band; evidence keeps the majority vote |
+| Holding the mark displaced indefinitely | Funding charges the crowded side per day, so displacement is a running cost rather than a free option |
 | Reporters disagreeing on the demand signal | Smoothing is one deterministic on-chain view, not per-node local state |
 | Vault insolvency from a large position | Per-position MM liability reserved against pool liquidity at open, payout capped |
 | Trader spending someone else's collateral | Trader margin escrowed in `totalMargin`, separate from MM capital |
@@ -602,14 +650,10 @@ deliberate simplifications:
 - **Reporter network is simulated in one process.** Production needs
   genuinely independent operators, keys held separately, and a real gossip/
   aggregation transport between them instead of in-process objects.
-- **No funding rate.** Perp venues charge a periodic funding payment
-  between longs and shorts to keep the contract tethered to spot and to
-  compensate whoever carries the imbalance. Here the inventory-skewed
-  *taker* fee does the balancing work at trade time only -- a trader who
-  opens into an imbalance and holds pays nothing extra for the carry. A
-  continuous funding accrual on open positions is the natural next
-  addition, and it slots in as a per-position accrual against
-  `netNotional` without disturbing the settlement math.
+- **Funding accrues at a first-order approximation.** The rate is applied
+  over each interval at the skew prevailing when the interval is settled,
+  rather than integrating a continuously-moving rate. More frequent `poke()`
+  calls tighten it; the error is small when the book is active.
 - **Single market maker, no LP share accounting.** `MARKET_MAKER_ROLE` is
   one counterparty with an undivided claim on `totalLiquidity`; a real
   venue would tokenize pool ownership so multiple LPs could share fees and

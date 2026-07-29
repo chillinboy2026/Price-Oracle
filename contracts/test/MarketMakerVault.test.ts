@@ -22,6 +22,8 @@ const CONFIG = {
   liquidationPenaltyBps: 200n, // 2% of notional
   liquidatorShareBps: 5_000n, // half the penalty to the keeper
   skewSmoothingWindow: 0n, // smoothing tested separately; off here for determinism
+  fundingCoefficientBps: 0n, // funding tested separately
+  maxFundingRateBpsPerDay: 0n,
 };
 
 function configTuple(overrides: Partial<typeof CONFIG> = {}) {
@@ -36,6 +38,8 @@ function configTuple(overrides: Partial<typeof CONFIG> = {}) {
     liquidationPenaltyBps: c.liquidationPenaltyBps,
     liquidatorShareBps: c.liquidatorShareBps,
     skewSmoothingWindow: c.skewSmoothingWindow,
+    fundingCoefficientBps: c.fundingCoefficientBps,
+    maxFundingRateBpsPerDay: c.maxFundingRateBpsPerDay,
   };
 }
 

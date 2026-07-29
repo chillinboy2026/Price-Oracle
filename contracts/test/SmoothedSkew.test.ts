@@ -22,6 +22,8 @@ const CONFIG = {
   liquidationPenaltyBps: 200n,
   liquidatorShareBps: 5_000n,
   skewSmoothingWindow: 24n * 3_600n, // 24h
+  fundingCoefficientBps: 0n,
+  maxFundingRateBpsPerDay: 0n,
 };
 
 describe("smoothed inventory skew", function () {
