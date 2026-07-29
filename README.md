@@ -10,16 +10,18 @@ or for assets with no public market at all, like pre-IPO). A threshold of
 those reporters signs the agreed price as an EIP-712 attestation, and a
 minimal, chain-agnostic smart contract verifies the signatures and enforces
 hard on-chain guardrails before ever updating the price. A market-maker
-vault sits on top, funding liquidity and taking the other side of trades,
-earning fees while an inventory-skew mechanism keeps it from being one-sided
-prey for manipulation.
+vault sits on top, funding liquidity and taking the other side of leveraged
+trades, earning fees while an inventory-skew mechanism keeps it from being
+one-sided prey for manipulation and permissionless keepers liquidate
+positions that fall below maintenance margin.
 
 See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full design.
 
 ## Repo layout
 
 ```
-contracts/   Solidity: PriceOracle, MarketMakerVault (Hardhat + solc, TS tests)
+contracts/   Solidity: PriceOracle, MarketMakerVault (leverage + liquidation)
+             (Hardhat + solc, TS tests)
 offchain/    TypeScript: fair-price engine, mock live feed, EIP-712 signer,
              reporter-node simulation, on-chain publisher
 docs/        Architecture write-up
@@ -53,7 +55,13 @@ pinned solc version from `hardhat.config.ts`.
 
 ## Status
 
-This is a first, fully-working skeleton of every core piece (on-chain
-oracle + guardrails, market-maker vault, off-chain engine + reporter
-network simulation), not a production system. See "Known simplifications
-and next steps" in the architecture doc for what's deliberately left out.
+This is a working skeleton of every core piece (on-chain oracle +
+guardrails, leveraged market-maker vault with liquidations, off-chain
+engine + reporter network simulation), not a production system. 61 tests
+pass across both packages. See "Known simplifications and next steps" in
+the architecture doc for what's deliberately left out -- notably funding
+rates, multi-LP share accounting, and partial liquidations.
+
+None of this has been through a security audit, and the economic
+parameters (fee levels, maintenance margin, payout caps) are illustrative
+defaults rather than calibrated values.

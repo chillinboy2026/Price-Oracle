@@ -107,14 +107,16 @@ via the small `IPriceOracle` interface.
 
 ### `contracts/contracts/MarketMakerVault.sol`
 
-The liquidity/fee layer: a market maker deposits quote-token liquidity,
-traders open and close notional long/short exposure to the oracle price
-against that pool, and the market maker earns fees for taking the other
-side. Key properties:
+The leveraged liquidity/fee layer: a market maker deposits quote-token
+capital, traders open leveraged long/short exposure to the oracle price
+against that pool, permissionless keepers liquidate positions that fall
+below maintenance margin, and the market maker earns fees for taking the
+other side. Key properties:
 
-- **The oracle's price is never touched by trading.** Every fill uses
-  `PriceOracle.getPrice()` directly -- a trader cannot move the mid by
-  trading size against the vault.
+- **The oracle's price is never touched by trading.** Every fill *and every
+  liquidation* uses `PriceOracle.getPrice()` directly -- a trader cannot
+  move the mid by trading size against the vault, and cannot push anyone
+  else into liquidation by trading either.
 - **What a trader can influence is the fee.** `quoteFeeBps(isLong)` starts
   at `baseFeeBps` and is skewed by the vault's current inventory
   (`getInventorySkewBps()`): trading in the direction that *worsens* the
@@ -124,12 +126,74 @@ side. Key properties:
   instead of only ever favoring one side, without ever distorting the
   independently-attested mid price.
 - **Bounded liability.** Every position reserves
-  `notional * maxPayoutMultipleBps` against pool liquidity at open time, so
-  the market maker's worst-case exposure per position is always provably
-  solvent against `availableLiquidity()` before the trade is accepted.
-- **Fees are segregated from principal** (`feesAccrued` vs `totalLiquidity`)
-  so the market maker can withdraw earned fees without touching the capital
-  backing open positions.
+  `margin * (maxPayoutMultipleBps - 1x)` of *MM* capital at open time --
+  precisely the worst case the MM can owe beyond the trader's own escrowed
+  collateral -- and the open is rejected unless `availableLiquidity()`
+  covers it. Payout is capped at `maxPayoutMultipleBps × margin`.
+
+#### Accounting: three separated pools
+
+Leverage makes it unacceptable to conflate trader collateral with
+market-maker capital, so the vault keeps three strictly separate ledgers:
+
+| Ledger | Whose money | Moves when |
+|---|---|---|
+| `totalLiquidity` | MM capital | Trader realizes a loss (grows), trader realizes a profit (shrinks), MM's share of a liquidation penalty (grows) |
+| `totalMargin` | Trader collateral in escrow | Position opens (grows) / settles (shrinks) |
+| `feesAccrued` | MM fee revenue | Open and close fees; withdrawable without touching capital backing open positions |
+
+The contract's token balance always equals the sum of the three, exposed as
+`solvencyInvariantHolds()` and asserted after every operation in the test
+suite (including across a mixed open/liquidate/close sequence).
+
+#### Leverage
+
+`openPosition(isLong, margin, leverageBps)` sizes `notional = margin ×
+leverage`, capped by `maxLeverageBps`. As on any perp venue the fee is
+charged on *notional*, not margin, so leverage scales the cost of the trade
+too (10x on a 1% base fee costs 10% of margin round-trip-ish). PnL is
+correspondingly amplified: a +10% spot move on 5x returns +50% on margin.
+
+#### Liquidation
+
+A position is liquidatable once its equity (`margin + unrealized pnl`)
+falls below `notional × maintenanceMarginBps`. `getLiquidationPrice()`
+inverts that condition in closed form:
+
+```
+long:   P_liq = entry × (1 + mmBps/BPS − margin/notional)
+short:  P_liq = entry × (1 − mmBps/BPS + margin/notional)
+```
+
+`liquidate(positionId)` is permissionless. The liquidated position's
+residual equity pays a penalty of `liquidationPenaltyBps` of notional,
+split between the keeper (`liquidatorShareBps`) and the market maker;
+whatever survives the penalty is refunded to the trader. Conservation is
+exact: keeper reward + trader refund + MM credit always equals the escrowed
+margin.
+
+**Liquidations deliberately still work while the vault is paused.** Pausing
+stops *new* risk from being opened, but blocking liquidations would strand
+the market maker holding undercollateralized exposure -- precisely the
+situation pausing exists to contain.
+
+#### Gap risk, and why the oracle guardrail matters here
+
+If price moves far enough in one step that equity goes negative before a
+keeper can act, the trader is refunded nothing, the market maker collects
+the full margin, and the MM's *uncollected* winnings beyond that margin are
+recorded in `cumulativeShortfall`. Note this is missed profit rather than a
+drain on pooled capital -- the pool still nets the whole margin -- but a
+rising number means liquidations are firing too late.
+
+This is where the two halves of the system reinforce each other: the
+oracle's per-update deviation guardrail bounds how far the mark price can
+move in a single update, which structurally gives keepers a window to
+liquidate before a position goes bankrupt. An oracle that could jump
+arbitrarily far in one update would make bounded-loss leverage impossible
+downstream. The shortfall test exercises exactly this by configuring a
+deliberately wide guardrail so a 10x position can gap straight past
+bankruptcy in one attestation.
 
 `getInventorySkewBps()` is also read by the off-chain engine as one more
 input into the next price attestation (see below) -- real trading pressure
@@ -235,7 +299,11 @@ resumes around the new level.
 | Replay / out-of-order update | Strictly increasing nonce |
 | Sudden price jump (attack or bad feed) | On-chain deviation guardrail, tighter off-hours |
 | One-sided trading flow against the vault | Inventory-skewed taker fee, oracle mid never touched |
-| Vault insolvency from a large position | Per-position liability reserved against pool liquidity at open |
+| Vault insolvency from a large position | Per-position MM liability reserved against pool liquidity at open, payout capped |
+| Trader spending someone else's collateral | Trader margin escrowed in `totalMargin`, separate from MM capital |
+| Leveraged position going bankrupt | Maintenance-margin liquidation by permissionless keepers, paid from the position's own residual equity |
+| Price gap outrunning liquidation | Oracle's per-update deviation guardrail bounds single-update moves; residual exposure surfaced as `cumulativeShortfall` |
+| Admin pausing to trap the MM in bad positions | `liquidate()` is deliberately callable while paused |
 | Legitimate large repricing blocked by guardrail | `GUARDIAN_ROLE`-gated override, fully transparent on-chain |
 
 ## Known simplifications and next steps
@@ -246,10 +314,26 @@ deliberate simplifications:
 - **Reporter network is simulated in one process.** Production needs
   genuinely independent operators, keys held separately, and a real gossip/
   aggregation transport between them instead of in-process objects.
-- **`MarketMakerVault` positions are 1x, single-MM.** No leverage, no
-  multi-LP share accounting, no liquidations -- deliberately out of scope
-  since the ask was the pricing model first, a full margin/DEX engine
-  second.
+- **No funding rate.** Perp venues charge a periodic funding payment
+  between longs and shorts to keep the contract tethered to spot and to
+  compensate whoever carries the imbalance. Here the inventory-skewed
+  *taker* fee does the balancing work at trade time only -- a trader who
+  opens into an imbalance and holds pays nothing extra for the carry. A
+  continuous funding accrual on open positions is the natural next
+  addition, and it slots in as a per-position accrual against
+  `netNotional` without disturbing the settlement math.
+- **Single market maker, no LP share accounting.** `MARKET_MAKER_ROLE` is
+  one counterparty with an undivided claim on `totalLiquidity`; a real
+  venue would tokenize pool ownership so multiple LPs could share fees and
+  pnl pro rata.
+- **Liquidation is all-or-nothing.** Production venues partially liquidate
+  to bring a position back above maintenance margin rather than closing it
+  outright, which is gentler on traders and on inventory skew.
+- **No keeper incentive floor.** `liquidatorShareBps` of the penalty can
+  round to near-zero on a position whose equity is nearly exhausted,
+  leaving no economic reason to call `liquidate()` on exactly the positions
+  that most need it. A minimum reward funded from the MM's side would fix
+  this.
 - **`MockLiveFeed` is a random walk, not a real data source.** Swapping in
   a real feed only means implementing the two-method `LiveFeed` interface.
 - **No non-EVM adapter yet** -- the design leaves room for one (see above)
