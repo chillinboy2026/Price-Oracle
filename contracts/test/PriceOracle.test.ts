@@ -33,6 +33,7 @@ describe("PriceOracle", function () {
       maxStaleness: 300,
       minPrice: 0,
       maxPrice: 0,
+      anchorBand: ethers.ZeroAddress,
     });
 
     const network = await ethers.provider.getNetwork();

@@ -7,7 +7,8 @@
     "build": "tsc -p tsconfig.json",
     "test": "vitest run",
     "dev": "tsx src/index.ts",
-    "demo": "tsx scripts/demo-live-feed.ts"
+    "demo": "tsx scripts/demo-live-feed.ts",
+    "demo:preipo": "tsx scripts/demo-preipo.ts"
   },
   "dependencies": {
     "ethers": "^6.13.1"

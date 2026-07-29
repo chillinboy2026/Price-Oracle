@@ -350,17 +350,114 @@ format without changing anything in `offchain/` -- the off-chain network
 doesn't know or care which chain it's ultimately publishing to beyond the
 `Publisher` implementation it's configured with.
 
-## Pre-IPO markets
+## Pre-IPO markets: the anchor model
 
-A pre-IPO asset has no continuous public market, so it is effectively
-*always* in the OFF_HOURS branch of the model: the synthetic drift +
-inventory-skew mechanism isn't a fallback, it's the primary pricing engine.
-The same `guardianOverridePrice` path used for a public-market earnings gap
-doubles as the mechanism for incorporating a discrete real-world repricing
-event for a pre-IPO name -- a new priced funding round, a secondary
-transaction, a 409A mark -- as an authenticated, threshold-signed,
-transparently-logged anchor point, after which the bounded drift model
-resumes around the new level.
+A public stock has a live market, so the oracle's job is mostly to follow it
+safely. A pre-IPO company has no such market. Its value is established at
+sparse, discrete moments -- a priced round, a tender offer, a 409A, a
+secondary -- and between those moments it is genuinely unobservable.
+
+So the model inverts. For a public asset, the live feed sets the price and
+guardrails bound how fast it may move. For a pre-IPO asset, **real-world
+evidence sets the bounds and on-chain order flow discovers the price inside
+them.** The synthetic drift isn't a fallback for when the market is closed;
+it *is* the pricing engine, tethered by anchors.
+
+Run `pnpm --filter ./offchain demo:preipo` to walk the whole lifecycle.
+
+### The headline valuation is not a price
+
+Two things sit between "Series D at $3bn" and a number worth publishing, and
+both are handled in `offchain/src/anchor/capTable.ts`.
+
+**Share count.** $3bn over how many shares? Fully-diluted counts include
+granted options, the *unissued* option pool, and warrants. Whether the
+unissued pool is included materially changes the answer.
+
+**Share class.** A priced round prices *preferred*, which carries a
+liquidation preference. Common -- what employees hold, what secondaries
+trade, and what tokenized exposure actually tracks -- is junior to that
+stack. `waterfall()` distributes an exit value across the preference stack
+(seniority tiers, pari-passu splits, participating vs non-participating,
+conversion decisions solved by greedy fixpoint) and returns what common
+receives.
+
+The behavior this produces is subtle and correct. At a valuation that clears
+the whole stack, every series converts and common equals the headline price.
+Lower down, the preference bites hard. And a late series can be *underwater*
+even at a healthy valuation: if Series C paid $64/share and the round implies
+$50/share, C takes its preference rather than converting, dragging common
+below the headline even though nothing went wrong.
+
+Because common's value depends on the *distribution* of outcomes rather than
+one number, `expectedCommonPrice()` runs the waterfall across probability-
+weighted exit scenarios and applies an explicit discount for lack of
+marketability. **This is not a 409A.** A real independent valuation
+backsolves an option pricing model against the last round price; `dlomBps` is
+a deliberate input rather than a derived result, precisely so it cannot
+masquerade as a modelled one.
+
+### `contracts/AnchorRegistry.sol`
+
+Anchors live on-chain with full provenance: the event kind, when it *took
+effect* (not when it was reported), which share class it prices, the implied
+valuation, and a hash of the source document. An anchor is auditable against
+evidence rather than being a bare number someone asserted.
+
+Anchors are threshold-attested by `ATTESTOR_ROLE` holders using the same
+EIP-712 scheme as price attestations, so no single party can invent a
+valuation. The registry also rejects:
+
+- an anchor priced in a different share class than the asset is configured
+  for, so a preferred round price can never be silently applied as common;
+- a newly-surfaced *older* event overwriting more recent evidence (ordering
+  is by effective date, not submission);
+- replayed nonces and future-dated events.
+
+### The band, and why it widens
+
+An anchor's *price* does not decay -- the round happened at the price it
+happened at. Its *authority* does. A round from last month tightly constrains
+today's value; the same round three years ago barely constrains it at all.
+
+So `currentBandBps()` widens the acceptable range with anchor age
+(`bandWideningBpsPerDay`), capped at `maxBandBps` so it never opens
+indefinitely. Different event kinds start at different widths and decay at
+different rates (`DEFAULT_KIND_PROFILES`), because they are not equivalent
+evidence: a priced round is real money at an arm's-length negotiated price; a
+409A is formal but deliberately conservative; a single small secondary is a
+real trade but information-poor; a recap resets the stack and makes prior
+evidence stale.
+
+### Enforced on-chain, not merely respected off-chain
+
+`AnchorRegistry` implements `IAnchorBand`, a deliberately minimal veto
+interface carrying no pre-IPO vocabulary at all -- the oracle only asks "is
+this price acceptable for this asset right now?". A `PriceOracle` asset sets
+`anchorBand` in its config to bind itself to a registry; `address(0)` (the
+normal case for a public-market asset) disables the check entirely and
+changes nothing.
+
+When bound, a fully threshold-signed price update sitting outside the band is
+rejected. Notably **`guardianOverridePrice` does not bypass the band** -- it
+bypasses the per-update deviation cap only. Repricing a pre-IPO asset
+requires new attested evidence, not authority, which is the whole point of
+moving anchors out of a guardian's discretion and into a registry.
+
+### Order flow inside the band
+
+`FairPriceEngine` takes an optional `anchor` input. When present it
+mean-reverts toward the anchor price (`anchorPullPerTick`) and hard-clamps to
+the band, mirroring `checkBand` so the engine never proposes a price the
+contract would reject. Confidence is then reported from anchor staleness
+rather than a session constant.
+
+Within the band, `MarketMakerVault`'s inventory skew does the work: sustained
+buying pressure walks the price toward the top of the band, sustained selling
+toward the bottom, and absent pressure the anchor pull returns it toward the
+last real-world mark. As the anchor ages the band widens and order flow gets
+progressively more room -- which is the right behavior, because as real-world
+evidence goes stale the market's own opinion should count for more.
 
 ## Manipulation resistance, summarized
 
@@ -380,6 +477,10 @@ resumes around the new level.
 | Price gap outrunning liquidation | Oracle's per-update deviation guardrail bounds single-update moves; residual exposure surfaced as `cumulativeShortfall` |
 | Admin pausing to trap the MM in bad positions | `liquidate()` is deliberately callable while paused |
 | Legitimate large repricing blocked by guardrail | `GUARDIAN_ROLE`-gated override, fully transparent on-chain |
+| Inventing a pre-IPO valuation | Anchors are threshold-attested with a source-document hash; the guardian override cannot bypass the band |
+| Applying a preferred round price as common | Anchors carry a share class, and the registry rejects a mismatch |
+| Backdating evidence to move the band | Anchors are ordered by effective date; an older event cannot overwrite newer evidence |
+| A stale anchor pinning price to a dead valuation | Band widens with anchor age, capped so it never opens indefinitely |
 
 ## Known simplifications and next steps
 
@@ -411,8 +512,27 @@ deliberate simplifications:
   this.
 - **Crypto venues only, so far.** The live feed covers public crypto spot
   markets. Equities/RWAs need a licensed vendor (see the feeds section
-  above); pre-IPO has no feed to integrate at all and runs on the
-  guardian-anchored path described below.
+  above); pre-IPO has no feed to integrate at all and runs on the anchor
+  model described above.
+- **The valuation model is not a 409A.** `expectedCommonPrice` is a
+  probability-weighted waterfall with an explicit DLOM input, not an option
+  pricing model backsolve. It is a defensible approximation and is labelled
+  as one; a production pre-IPO venue would want a real OPM, and arguably
+  wants the 409A itself as the anchor rather than a self-computed number.
+- **Cap tables are supplied, not verified.** Nothing on-chain attests that
+  the share counts and preference terms fed into the waterfall are correct.
+  In practice this makes the *attestor set* the trust anchor for cap-table
+  accuracy, which is worth being explicit about: the document hash proves an
+  anchor matches a document, not that the document is true.
+- **The waterfall's conversion solver is greedy.** Exact for standard stacks
+  (uniform seniority, 1x non-participating) and a good approximation for
+  layered ones, but not a general solver for pathological structures with
+  interacting seniority tiers and participation caps.
+- **No sector/comparables beta.** Between anchors the price drifts and
+  responds to order flow, but does not track a public comparables index. A
+  pre-IPO software company should probably move somewhat with its listed
+  peers; wiring a comparables feed into the drift is a natural next step and
+  would slot in beside the anchor pull.
 - **No volume weighting.** Aggregation treats a venue with $1bn of depth and
   one with $1m identically. Volume- or depth-weighting the median would make
   it meaningfully harder to influence, at the cost of trusting each venue's

@@ -6,6 +6,7 @@ import {EIP712} from "@openzeppelin/contracts/utils/cryptography/EIP712.sol";
 import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
 
+import {IAnchorBand} from "./interfaces/IAnchorBand.sol";
 import {IPriceOracle} from "./interfaces/IPriceOracle.sol";
 import {PriceAttestationLib} from "./libraries/PriceAttestationLib.sol";
 
@@ -60,6 +61,12 @@ contract PriceOracle is IPriceOracle, AccessControl, Pausable, EIP712 {
         uint32 maxStaleness; // seconds; attestation.timestamp vs block.timestamp
         uint256 minPrice; // absolute sanity floor, 1e18 fixed point (0 = disabled)
         uint256 maxPrice; // absolute sanity ceiling, 1e18 fixed point (0 = disabled)
+        // Optional external bound consulted on every accepted price. Used for
+        // assets with no continuous market (pre-IPO), where an AnchorRegistry
+        // constrains the price to a band around the last real-world valuation
+        // event. address(0) disables the check, which is the normal case for a
+        // public-market asset that already has a live feed to cross-check.
+        address anchorBand;
     }
 
     struct AssetState {
@@ -97,6 +104,7 @@ contract PriceOracle is IPriceOracle, AccessControl, Pausable, EIP712 {
     error PriceOutOfBounds(uint256 price, uint256 minPrice, uint256 maxPrice);
     error DeviationExceeded(uint256 deviationBps, uint256 maxDeviationBps);
     error PriceStale(uint256 timestamp, uint256 nowTs, uint256 maxStaleness);
+    error OutsideAnchorBand(uint256 price, uint256 lower, uint256 upper);
 
     constructor(address admin) EIP712("PriceOracle", "1") {
         _grantRole(DEFAULT_ADMIN_ROLE, admin);
@@ -152,6 +160,7 @@ contract PriceOracle is IPriceOracle, AccessControl, Pausable, EIP712 {
         if (validSigners < config.threshold) revert InsufficientSignatures(validSigners, config.threshold);
 
         _checkAbsoluteBounds(attestation.price, config.minPrice, config.maxPrice);
+        _checkAnchorBand(config.anchorBand, attestation.assetId, attestation.price);
 
         if (state.timestamp != 0) {
             uint16 maxDeviationBps = attestation.session == PriceAttestationLib.MarketSession.LIVE
@@ -191,6 +200,12 @@ contract PriceOracle is IPriceOracle, AccessControl, Pausable, EIP712 {
         if (validSigners < config.threshold) revert InsufficientSignatures(validSigners, config.threshold);
 
         _checkAbsoluteBounds(attestation.price, config.minPrice, config.maxPrice);
+        // The guardian override bypasses the *deviation* cap, not the anchor
+        // band. A pre-IPO repricing is supposed to arrive as a new anchor with
+        // its own provenance; letting a guardian jump the price outside the
+        // band without one would reintroduce exactly the unilateral authority
+        // the registry exists to remove.
+        _checkAnchorBand(config.anchorBand, attestation.assetId, attestation.price);
 
         uint256 previousPrice = state.price;
         state.price = attestation.price;
@@ -249,6 +264,12 @@ contract PriceOracle is IPriceOracle, AccessControl, Pausable, EIP712 {
     function _checkAbsoluteBounds(uint256 price, uint256 minPrice, uint256 maxPrice) internal pure {
         if (minPrice != 0 && price < minPrice) revert PriceOutOfBounds(price, minPrice, maxPrice);
         if (maxPrice != 0 && price > maxPrice) revert PriceOutOfBounds(price, minPrice, maxPrice);
+    }
+
+    function _checkAnchorBand(address anchorBand, bytes32 assetId, uint256 price) internal view {
+        if (anchorBand == address(0)) return;
+        (bool ok, uint256 lower, uint256 upper) = IAnchorBand(anchorBand).checkBand(assetId, price);
+        if (!ok) revert OutsideAnchorBand(price, lower, upper);
     }
 
     function _checkDeviation(uint256 oldPrice, uint256 newPrice, uint16 maxDeviationBps) internal pure {

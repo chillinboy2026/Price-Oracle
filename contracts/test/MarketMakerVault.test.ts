@@ -83,6 +83,7 @@ describe("MarketMakerVault", function () {
       maxStaleness: 86_400,
       minPrice: 0,
       maxPrice: 0,
+      anchorBand: ethers.ZeroAddress,
     });
 
     const network = await ethers.provider.getNetwork();

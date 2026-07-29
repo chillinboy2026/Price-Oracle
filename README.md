@@ -20,9 +20,10 @@ See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full design.
 ## Repo layout
 
 ```
-contracts/   Solidity: PriceOracle, MarketMakerVault (leverage + liquidation)
-             (Hardhat + solc, TS tests)
-offchain/    TypeScript: fair-price engine, mock live feed, EIP-712 signer,
+contracts/   Solidity: PriceOracle, MarketMakerVault (leverage + liquidation),
+             AnchorRegistry (pre-IPO valuation anchors)
+offchain/    TypeScript: fair-price engine, multi-exchange live feed,
+             cap-table/waterfall math, anchor book, EIP-712 signers,
              reporter-node simulation, on-chain publisher
 docs/        Architecture write-up
 ```
@@ -43,6 +44,11 @@ pnpm offchain:test
 # shows normal aggregation, an outlier venue being discarded, and the feed
 # losing quorum and degrading to the off-hours model.
 pnpm --filter ./offchain demo
+
+# Walk the pre-IPO anchor lifecycle: headline valuation -> cap-table
+# waterfall -> common price -> anchor + band -> order flow inside the band
+# -> band widening with age -> a new anchor resetting it.
+pnpm --filter ./offchain demo:preipo
 
 # Run the off-chain orchestrator locally against real crypto exchanges
 # (dry-run: logs what it would publish on-chain; set RPC_URL /
@@ -87,12 +93,16 @@ pinned solc version from `hardhat.config.ts`.
 
 This is a working skeleton of every core piece (on-chain oracle +
 guardrails, leveraged market-maker vault with liquidations, multi-exchange
-live feed, off-chain engine + reporter network simulation), not a
-production system. 85 tests pass across both packages. See "Known
-simplifications and next steps" in the architecture doc for what's
-deliberately left out -- notably funding rates, multi-LP share accounting,
-partial liquidations, and volume-weighted feed aggregation.
+live feed, pre-IPO anchor registry with cap-table math, off-chain engine +
+reporter network simulation), not a production system. 133 tests pass
+across both packages.
 
-None of this has been through a security audit, and the economic
-parameters (fee levels, maintenance margin, payout caps) are illustrative
+See "Known simplifications and next steps" in the architecture doc for
+what's deliberately left out -- notably funding rates, multi-LP share
+accounting, partial liquidations, volume-weighted feed aggregation, and a
+real option-pricing-model valuation (the cap-table math is a labelled
+approximation, not a 409A).
+
+None of this has been through a security audit, and the economic parameters
+(fee levels, maintenance margin, payout caps, band widths) are illustrative
 defaults rather than calibrated values.

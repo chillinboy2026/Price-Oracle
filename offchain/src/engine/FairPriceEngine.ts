@@ -1,3 +1,4 @@
+import { AnchorReference } from "../anchor/AnchorBook.js";
 import { FairPriceResult, FairPriceState, LiveFeedQuote, MarketSession } from "../types.js";
 import { GuardrailConfig, clampToDeviation, maxDeviationForSession } from "./Guardrails.js";
 import { RandomFn } from "../util/rng.js";
@@ -28,6 +29,12 @@ export interface FairPriceEngineConfig {
    * from the live open, and snapping to it in one step would likely itself
    * violate the (tighter, cross-checked) LIVE deviation guardrail. */
   reconciliationSteps: number;
+  /** Fraction (0-1) of the gap to the anchored reference closed per tick when
+   * an anchor is supplied. This is what stops an unobservable asset's price
+   * from random-walking away from the last real-world valuation: absent order
+   * flow pushing the other way, it drifts back toward the anchor rather than
+   * wandering freely inside the band. */
+  anchorPullPerTick?: number;
   random?: RandomFn;
 }
 
@@ -36,6 +43,10 @@ export interface EngineInputs {
   /** Signed bps from MarketMakerVault.getInventorySkewBps(); 0 if unavailable. */
   inventorySkewBps: number;
   now: number; // unix seconds
+  /** Current anchored reference for an asset with no continuous market
+   * (pre-IPO). When present the engine mean-reverts toward it and hard-clamps
+   * to its band; when absent the engine behaves exactly as before. */
+  anchor?: AnchorReference | null;
 }
 
 export class FairPriceEngine {
@@ -91,9 +102,27 @@ export class FairPriceEngine {
       target = this.state.price * (1 + stepBps / 10_000);
     }
 
+    // Mean-revert toward the anchored reference before order flow is applied,
+    // so the pull sets where price sits absent pressure and skew moves it from
+    // there -- rather than the two fighting over the same tick.
+    const anchor = inputs.anchor ?? null;
+    if (anchor) {
+      const pull = this.config.anchorPullPerTick ?? 0;
+      target = target + (anchor.price - target) * pull;
+    }
+
     const skewBpsClamped = Math.max(-10_000, Math.min(10_000, inputs.inventorySkewBps));
     const skewAdjustmentBps = (skewBpsClamped / 10_000) * this.config.skewInfluenceBps;
     target = target * (1 - skewAdjustmentBps / 10_000);
+
+    // The anchor band is a hard bound, applied before the per-update guardrail.
+    // It mirrors AnchorRegistry.checkBand on-chain, so the engine never
+    // proposes a price the contract would reject outright.
+    if (anchor) {
+      const lower = anchor.price * (1 - anchor.bandBps / 10_000);
+      const upper = anchor.price * (1 + anchor.bandBps / 10_000);
+      target = Math.min(Math.max(target, lower), upper);
+    }
 
     const maxDeviationBps = maxDeviationForSession(session, this.config.guardrails);
     const clamped = clampToDeviation(this.state.price, target, maxDeviationBps);
@@ -111,7 +140,9 @@ export class FairPriceEngine {
       timestamp: this.state.timestamp,
       session: this.state.session,
       nonce: this.state.nonce,
-      confidenceBps: session === MarketSession.LIVE ? 10 : 50,
+      // With an anchor present, confidence comes from how stale the underlying
+      // real-world evidence is rather than from a session constant.
+      confidenceBps: anchor ? anchor.confidenceBps : session === MarketSession.LIVE ? 10 : 50,
     };
   }
 }
