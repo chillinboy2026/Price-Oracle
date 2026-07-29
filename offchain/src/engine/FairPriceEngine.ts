@@ -1,6 +1,12 @@
 import { AnchorReference } from "../anchor/AnchorBook.js";
 import { FairPriceResult, FairPriceState, LiveFeedQuote, MarketSession } from "../types.js";
 import { GuardrailConfig, clampToDeviation, maxDeviationForSession } from "./Guardrails.js";
+import {
+  DEFAULT_MARKET_PRESSURE,
+  MarketPressureConfig,
+  MarketPressureResult,
+  computeMarketPressure,
+} from "./MarketPressure.js";
 import { RandomFn } from "../util/rng.js";
 
 export interface FairPriceEngineConfig {
@@ -15,14 +21,10 @@ export interface FairPriceEngineConfig {
    * live volatility, since there is no independent market to cross-check
    * an off-hours move against. */
   offHoursVolatilityBpsPerTick: number;
-  /** Max pull (bps) the market-maker's inventory skew can exert on the fair
-   * price in a single tick, in either session. Positive inventorySkewBps
-   * means traders are net long / the market maker is net short; the engine
-   * nudges price down in that case (and up in the opposite case), which is
-   * what keeps the oracle's price responsive to real on-chain trading
-   * pressure rather than only ever tracking the live feed or drifting
-   * blindly off-hours. */
-  skewInfluenceBps: number;
+  /** How sustained order flow is converted into price displacement: the
+   * conviction threshold it must clear, how fast it saturates, and the share
+   * of the anchor band it may occupy. See MarketPressure. */
+  marketPressure?: MarketPressureConfig;
   /** Number of ticks over which to fully converge to the live price after
    * the reference market reopens, instead of jumping straight to it -- a
    * long off-hours session can leave the synthetic price meaningfully off
@@ -40,8 +42,13 @@ export interface FairPriceEngineConfig {
 
 export interface EngineInputs {
   liveQuote: LiveFeedQuote | null;
-  /** Signed bps from MarketMakerVault.getInventorySkewBps(); 0 if unavailable. */
+  /** Signed bps from MarketMakerVault.getInventorySkewBps(). Instantaneous, so
+   * only used as a fallback when the smoothed reading is unavailable. */
   inventorySkewBps: number;
+  /** Signed bps from MarketMakerVault.getSmoothedSkewBps() -- the demand signal
+   * the engine should normally price off, since it reflects sustained
+   * positioning rather than a momentary spike. */
+  smoothedSkewBps?: number;
   now: number; // unix seconds
   /** Current anchored reference for an asset with no continuous market
    * (pre-IPO). When present the engine mean-reverts toward it and hard-clamps
@@ -53,6 +60,7 @@ export class FairPriceEngine {
   private state: FairPriceState;
   private readonly config: FairPriceEngineConfig;
   private readonly random: RandomFn;
+  private lastPressure: MarketPressureResult | null = null;
 
   constructor(initialPrice: number, config: FairPriceEngineConfig, initialTimestamp = Math.floor(Date.now() / 1000)) {
     this.config = config;
@@ -68,6 +76,13 @@ export class FairPriceEngine {
 
   getState(): Readonly<FairPriceState> {
     return this.state;
+  }
+
+  /** Market-pressure decomposition from the most recent tick. Exposed for
+   * operators and dashboards: it is how you tell "price is high because comps
+   * rerated" apart from "price is high because the crowd is leaning". */
+  getLastPressure(): MarketPressureResult | null {
+    return this.lastPressure;
   }
 
   /** Overwrites internal state to a canonically agreed price (e.g. after the
@@ -102,22 +117,37 @@ export class FairPriceEngine {
       target = this.state.price * (1 + stepBps / 10_000);
     }
 
-    // Mean-revert toward the anchored reference before order flow is applied,
-    // so the pull sets where price sits absent pressure and skew moves it from
-    // there -- rather than the two fighting over the same tick.
     const anchor = inputs.anchor ?? null;
-    if (anchor) {
-      const pull = this.config.anchorPullPerTick ?? 0;
-      target = target + (anchor.price - target) * pull;
-    }
 
-    const skewBpsClamped = Math.max(-10_000, Math.min(10_000, inputs.inventorySkewBps));
-    const skewAdjustmentBps = (skewBpsClamped / 10_000) * this.config.skewInfluenceBps;
-    target = target * (1 - skewAdjustmentBps / 10_000);
+    // Sustained order flow moves the *equilibrium*, it does not fight it.
+    //
+    // The earlier design pushed price away from a fixed centre while the anchor
+    // pull dragged it back, and the two forces reached a standoff: past a
+    // modest amount of imbalance the equilibrium landed outside the band and
+    // price simply pinned to the edge, indifferent to whether conviction was
+    // mild or overwhelming. Displacing the centre instead means every level of
+    // conviction maps to a distinct price, and the band is approached
+    // asymptotically rather than hit.
+    const pressure = computeMarketPressure(
+      inputs.smoothedSkewBps ?? inputs.inventorySkewBps,
+      this.config.marketPressure ?? DEFAULT_MARKET_PRESSURE,
+      anchor?.bandBps
+    );
+    this.lastPressure = pressure;
+
+    if (anchor) {
+      const effectiveCentre = anchor.price * (1 + pressure.displacementBps / 10_000);
+      const pull = this.config.anchorPullPerTick ?? 0;
+      target = target + (effectiveCentre - target) * pull;
+    } else {
+      target = target * (1 + pressure.displacementBps / 10_000);
+    }
 
     // The anchor band is a hard bound, applied before the per-update guardrail.
     // It mirrors AnchorRegistry.checkBand on-chain, so the engine never
-    // proposes a price the contract would reject outright.
+    // proposes a price the contract would reject outright. Market displacement
+    // is capped strictly inside it, so in normal operation this clamp only
+    // catches drift and live-feed moves, never order flow.
     if (anchor) {
       const lower = anchor.price * (1 - anchor.bandBps / 10_000);
       const upper = anchor.price * (1 + anchor.bandBps / 10_000);

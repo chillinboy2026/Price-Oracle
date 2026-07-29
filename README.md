@@ -56,6 +56,11 @@ pnpm --filter ./offchain demo:preipo
 # comps-tracked one.
 pnpm --filter ./offchain demo:comps
 
+# How market sentiment and comparables share control: the conviction
+# threshold, diminishing returns on conviction, the cap that keeps evidence
+# in the majority, and how a stale anchor cedes ground to the market.
+pnpm --filter ./offchain demo:hype
+
 # Run the off-chain orchestrator locally against real crypto exchanges
 # (dry-run: logs what it would publish on-chain; set RPC_URL /
 # ORACLE_ADDRESS / PUBLISHER_PRIVATE_KEY to actually publish)
@@ -101,7 +106,7 @@ This is a working skeleton of every core piece (on-chain oracle +
 guardrails, leveraged market-maker vault with liquidations, multi-exchange
 live feed, pre-IPO anchor registry with cap-table math and comparables
 tracking, off-chain engine + reporter network simulation), not a production
-system. 166 tests pass across both packages.
+system. 191 tests pass across both packages.
 
 See "Known simplifications and next steps" in the architecture doc for
 what's deliberately left out -- notably funding rates, multi-LP share

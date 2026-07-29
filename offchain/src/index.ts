@@ -35,8 +35,16 @@ const engineConfig: FairPriceEngineConfig = {
   guardrails: { maxDeviationBpsLive: 200, maxDeviationBpsOffHours: 50 },
   liveBlendWeight: 0.5,
   offHoursVolatilityBpsPerTick: 5,
-  skewInfluenceBps: 20,
   reconciliationSteps: 5,
+  // A liquid public-market asset has a live feed to price off, so order flow
+  // against the vault should only ever nudge the mark. The conviction
+  // threshold still applies: transient imbalance moves nothing.
+  marketPressure: {
+    thresholdBps: 1_500,
+    saturationBps: 3_000,
+    marketShareOfBandBps: 6_000,
+    maxDisplacementBpsNoAnchor: 50,
+  },
 };
 
 async function resolvePublisher(): Promise<Publisher> {

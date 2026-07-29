@@ -106,7 +106,12 @@ const engineConfig: FairPriceEngineConfig = {
   guardrails: { maxDeviationBpsLive: 200, maxDeviationBpsOffHours: 200 },
   liveBlendWeight: 0.5,
   offHoursVolatilityBpsPerTick: 3,
-  skewInfluenceBps: 400,
+  marketPressure: {
+    thresholdBps: 1000,
+    saturationBps: 3_000,
+    marketShareOfBandBps: 6_000,
+    maxDisplacementBpsNoAnchor: 100,
+  },
   reconciliationSteps: 0,
   anchorPullPerTick: 0.02,
   random: mulberry32(7),
@@ -119,6 +124,7 @@ function run(label: string, skewBps: number, startDay: number, ticks = 400): num
     engine.tick({
       liveQuote: null,
       inventorySkewBps: skewBps,
+      smoothedSkewBps: skewBps,
       now: now + i * 3600,
       anchor: book.getReference(now)!,
     });
@@ -133,12 +139,12 @@ function run(label: string, skewBps: number, startDay: number, ticks = 400): num
 
 console.log("  30 days after the round:");
 run("no pressure", 0, 30);
-run("sustained buying pressure", -8_000, 30);
-run("sustained selling pressure", 8_000, 30);
+run("sustained buying pressure", 8_000, 30);
+run("sustained selling pressure", -8_000, 30);
 
 console.log("\n  Two years later, same pressure, wider band:");
-run("sustained buying pressure", -8_000, 730);
-run("sustained selling pressure", 8_000, 730);
+run("sustained buying pressure", 8_000, 730);
+run("sustained selling pressure", -8_000, 730);
 
 console.log("\n=== 4. A new anchor resets the band ===\n");
 

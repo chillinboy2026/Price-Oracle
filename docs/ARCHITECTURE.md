@@ -496,20 +496,75 @@ bypasses the per-update deviation cap only. Repricing a pre-IPO asset
 requires new attested evidence, not authority, which is the whole point of
 moving anchors out of a guardian's discretion and into a registry.
 
-### Order flow inside the band
+### Order flow inside the band: how sentiment and evidence share control
 
-`FairPriceEngine` takes an optional `anchor` input. When present it
-mean-reverts toward the anchor price (`anchorPullPerTick`) and hard-clamps to
-the band, mirroring `checkBand` so the engine never proposes a price the
-contract would reject. Confidence is then reported from anchor staleness
-rather than a session constant.
+Hype and despair around a pre-IPO name are real information and should move the
+mark. They must not be able to take it over, and a brief flurry of one-sided
+flow should not move it at all. Three mechanisms produce that, in order.
 
-Within the band, `MarketMakerVault`'s inventory skew does the work: sustained
-buying pressure walks the price toward the top of the band, sustained selling
-toward the bottom, and absent pressure the anchor pull returns it toward the
-last real-world mark. As the anchor ages the band widens and order flow gets
-progressively more room -- which is the right behavior, because as real-world
-evidence goes stale the market's own opinion should count for more.
+**1. Sustained-only, measured on-chain.** The engine prices off
+`MarketMakerVault.getSmoothedSkewBps()`, not the instantaneous skew.
+Instantaneous skew is trivially spikeable: one large position opened and closed
+within the hour would otherwise read as demand identical to a thousand traders
+holding for a month. Smoothing over `skewSmoothingWindow` means only sustained
+positioning accumulates.
+
+This lives on-chain for a specific reason. Reporters must agree on one price to
+threshold-sign; if each kept a local moving average, nodes that started at
+different times would hold different state and never converge. One objective
+on-chain number keeps them deterministic — and makes the demand input to the
+price as auditable as the price itself. The view advances to `block.timestamp`
+on read, so it stays correct without anyone poking it, and `pokeSkew()` exists
+for assets that go long stretches without trading.
+
+**2. A conviction threshold.** Below `thresholdBps` of smoothed skew, the
+displacement is *exactly zero* — not merely small. A pre-IPO name should not
+reprice because a handful of traders leaned one way for an afternoon. The
+threshold is symmetric, so it gates moves in both directions equally.
+
+**3. Saturating displacement, capped at a share of the band.** Past the
+threshold, displacement grows through a `tanh`, so the first units of
+conviction move price most and each additional unit moves it less. The ceiling
+is `bandBps × marketShareOfBandBps` — a *fraction* of the band, never all of
+it. Comparables and anchors therefore always retain majority control of the
+level.
+
+```
+pressure     = deadband(smoothedSkew, thresholdBps)
+room         = bandBps × marketShareOfBandBps
+displacement = room × tanh(pressure / saturationBps)
+effectiveCentre = compsAdjustedAnchor × (1 + displacement)
+```
+
+**Flow displaces the centre; it does not fight it.** An earlier version pushed
+price away from a fixed centre while the anchor pull dragged it back, and the
+two reached a standoff: past a modest imbalance the equilibrium landed outside
+the band and price simply pinned to the edge, indifferent to whether conviction
+was mild or overwhelming. Information above that point was discarded. Moving
+the centre instead means every level of conviction maps to a distinct price,
+and the band is approached asymptotically rather than hit.
+
+**Sign convention: excess demand raises the price.** Positive skew means
+traders are net long, and a clearing market prices that up. Discouraging the
+crowded side is the job of the vault's skewed *fee*; the oracle's mid should
+aggregate the information in order flow, not fade it. (An earlier version had
+this inverted, which systematically moved the mark against whichever side the
+crowd was on — a quiet bias in the market maker's favour.)
+
+As the anchor ages the band widens, and since the market's room is a fixed
+share of the band, sentiment automatically earns proportionally more say. That
+is the intended trade: the less current the last valuation event, the more
+weight belongs with whoever is actually willing to trade.
+
+`pnpm --filter ./offchain demo:hype` shows all of this — the threshold, the
+diminishing returns, the cap, and the widening with age.
+
+**What this does not prevent.** An actor who can hold a large one-sided
+position for weeks *can* move the mark, by up to the room above. That is the
+mechanism working as designed rather than a bypass of it: sustained capital at
+risk is exactly the signal the model is meant to listen to. What bounds it is
+the cap, plus the cost of financing that position against a fee that rises the
+more one-sided the book becomes.
 
 ## Manipulation resistance, summarized
 
@@ -523,6 +578,9 @@ evidence goes stale the market's own opinion should count for more.
 | Replay / out-of-order update | Strictly increasing nonce |
 | Sudden price jump (attack or bad feed) | On-chain deviation guardrail, tighter off-hours |
 | One-sided trading flow against the vault | Inventory-skewed taker fee, oracle mid never touched |
+| Spiking the mark with a brief large position | Skew is smoothed on-chain over a window, so only sustained positioning is visible |
+| Sentiment overwhelming real-world evidence | Displacement capped at a fixed share of the band; evidence keeps the majority vote |
+| Reporters disagreeing on the demand signal | Smoothing is one deterministic on-chain view, not per-node local state |
 | Vault insolvency from a large position | Per-position MM liability reserved against pool liquidity at open, payout capped |
 | Trader spending someone else's collateral | Trader margin escrowed in `totalMargin`, separate from MM capital |
 | Leveraged position going bankrupt | Maintenance-margin liquidation by permissionless keepers, paid from the position's own residual equity |

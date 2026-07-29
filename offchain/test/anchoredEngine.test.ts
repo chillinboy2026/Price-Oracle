@@ -7,6 +7,23 @@ import { MarketSession } from "../src/types.js";
 const DAY = 86_400;
 const T0 = 1_800_000_000;
 
+/** Threshold above any skew used here, so tests that isolate anchor behaviour
+ * see no order-flow contribution at all. */
+const NO_PRESSURE = {
+  thresholdBps: 1_000_000,
+  saturationBps: 3_000,
+  marketShareOfBandBps: 6_000,
+  maxDisplacementBpsNoAnchor: 0,
+};
+
+/** Realistic pressure config for the order-flow tests. */
+const PRESSURE = {
+  thresholdBps: 1_500,
+  saturationBps: 3_000,
+  marketShareOfBandBps: 6_000,
+  maxDisplacementBpsNoAnchor: 100,
+};
+
 /** Guardrails default to wide here so anchor behavior is isolated; the test
  * that specifically checks the per-update cap still binds sets its own. */
 function config(overrides: Partial<FairPriceEngineConfig> = {}): FairPriceEngineConfig {
@@ -14,7 +31,7 @@ function config(overrides: Partial<FairPriceEngineConfig> = {}): FairPriceEngine
     guardrails: { maxDeviationBpsLive: 10_000, maxDeviationBpsOffHours: 10_000 },
     liveBlendWeight: 0.5,
     offHoursVolatilityBpsPerTick: 0,
-    skewInfluenceBps: 0,
+    marketPressure: NO_PRESSURE,
     reconciliationSteps: 0,
     anchorPullPerTick: 0.25,
     random: () => 0.5, // no synthetic noise, isolating the anchor behavior
@@ -67,36 +84,74 @@ describe("anchor-aware FairPriceEngine", () => {
     expect(engine.getState().price).toBeCloseTo(20, 4);
   });
 
-  it("hard-clamps to the anchor band even under extreme order flow", () => {
-    // Enormous skew influence: without the band this would push price far away.
-    const engine = new FairPriceEngine(20, config({ skewInfluenceBps: 20_000, anchorPullPerTick: 0 }), T0);
+  it("keeps order flow strictly inside the band, approaching it but never pinning", () => {
+    // Overwhelming, sustained demand. Under the old tug-of-war model this
+    // pinned flat against the band edge; displacement is capped at a share of
+    // the band, so the edge is approached and never reached.
+    const engine = new FairPriceEngine(20, config({ marketPressure: PRESSURE, anchorPullPerTick: 0.2 }), T0);
     const anchor = reference({ price: 20, bandBps: 1_500 });
 
-    for (let i = 0; i < 50; i++) {
-      engine.tick({ liveQuote: null, inventorySkewBps: -10_000, now: T0 + i * 60, anchor });
+    for (let i = 0; i < 400; i++) {
+      engine.tick({ liveQuote: null, inventorySkewBps: 10_000, smoothedSkewBps: 10_000, now: T0 + i * 60, anchor });
     }
 
-    // Band is +/-15% around $20, i.e. [17, 23].
-    expect(engine.getState().price).toBeLessThanOrEqual(23 + 1e-9);
-    expect(engine.getState().price).toBeCloseTo(23, 6);
+    const price = engine.getState().price;
+    expect(price).toBeGreaterThan(20);
+    expect(price).toBeLessThan(23); // strictly inside [17, 23]
+    // Comps/anchor retain majority control: 60% of a 15% band is 9%.
+    expect(price).toBeLessThanOrEqual(20 * 1.09 + 1e-6);
+  });
+
+  it("gives more conviction a higher price, rather than saturating at the band", () => {
+    const anchor = reference({ price: 20, bandBps: 1_500 });
+    const engineConfig = config({ marketPressure: PRESSURE, anchorPullPerTick: 0.2 });
+
+    function settle(skewBps: number): number {
+      const engine = new FairPriceEngine(20, engineConfig, T0);
+      for (let i = 0; i < 400; i++) {
+        engine.tick({ liveQuote: null, inventorySkewBps: skewBps, smoothedSkewBps: skewBps, now: T0 + i * 60, anchor });
+      }
+      return engine.getState().price;
+    }
+
+    const mild = settle(2_500);
+    const strong = settle(4_500);
+    const extreme = settle(9_000);
+
+    // Each step up in conviction still moves price -- the old model was flat
+    // above ~3000bps because it pinned.
+    expect(strong).toBeGreaterThan(mild);
+    expect(extreme).toBeGreaterThan(strong);
+    // ...but with diminishing returns: doubling conviction does not double the move.
+    expect(extreme - strong).toBeLessThan(strong - mild);
+  });
+
+  it("ignores order flow that fails to clear the conviction threshold", () => {
+    const anchor = reference({ price: 20, bandBps: 1_500 });
+    const engine = new FairPriceEngine(20, config({ marketPressure: PRESSURE, anchorPullPerTick: 0.2 }), T0);
+
+    // Below thresholdBps: real positioning, but not sustained conviction.
+    for (let i = 0; i < 200; i++) {
+      engine.tick({ liveQuote: null, inventorySkewBps: 1_400, smoothedSkewBps: 1_400, now: T0 + i * 60, anchor });
+    }
+    expect(engine.getState().price).toBeCloseTo(20, 6);
   });
 
   it("lets order flow discover price inside the band, in both directions", () => {
     const anchor = reference({ price: 20, bandBps: 1_500 });
-    const engineConfig = config({ skewInfluenceBps: 500, anchorPullPerTick: 0.05 });
+    const engineConfig = config({ marketPressure: PRESSURE, anchorPullPerTick: 0.05 });
 
     const buyPressure = new FairPriceEngine(20, engineConfig, T0);
     const sellPressure = new FairPriceEngine(20, engineConfig, T0);
 
-    for (let i = 0; i < 30; i++) {
-      // Negative skew = traders net short = the vault is long = price pushed up.
-      buyPressure.tick({ liveQuote: null, inventorySkewBps: -5_000, now: T0 + i * 60, anchor });
-      sellPressure.tick({ liveQuote: null, inventorySkewBps: 5_000, now: T0 + i * 60, anchor });
+    for (let i = 0; i < 200; i++) {
+      // Positive skew = traders net long = excess demand = price up.
+      buyPressure.tick({ liveQuote: null, inventorySkewBps: 5_000, smoothedSkewBps: 5_000, now: T0 + i * 60, anchor });
+      sellPressure.tick({ liveQuote: null, inventorySkewBps: -5_000, smoothedSkewBps: -5_000, now: T0 + i * 60, anchor });
     }
 
     expect(buyPressure.getState().price).toBeGreaterThan(20);
     expect(sellPressure.getState().price).toBeLessThan(20);
-    // Both remain bounded by real-world evidence.
     expect(buyPressure.getState().price).toBeLessThanOrEqual(23 + 1e-9);
     expect(sellPressure.getState().price).toBeGreaterThanOrEqual(17 - 1e-9);
   });
@@ -111,13 +166,13 @@ describe("anchor-aware FairPriceEngine", () => {
       bandBps: 1_500,
     });
 
-    const engineConfig = config({ skewInfluenceBps: 20_000, anchorPullPerTick: 0 });
+    const engineConfig = config({ marketPressure: PRESSURE, anchorPullPerTick: 0.2 });
 
     function ceilingAt(now: number): number {
       const engine = new FairPriceEngine(20, engineConfig, now);
       const anchor = book.getReference(now)!;
-      for (let i = 0; i < 80; i++) {
-        engine.tick({ liveQuote: null, inventorySkewBps: -10_000, now: now + i * 60, anchor });
+      for (let i = 0; i < 300; i++) {
+        engine.tick({ liveQuote: null, inventorySkewBps: 10_000, smoothedSkewBps: 10_000, now: now + i * 60, anchor });
       }
       return engine.getState().price;
     }

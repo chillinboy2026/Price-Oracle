@@ -10,7 +10,8 @@
     "dev": "tsx src/index.ts",
     "demo": "tsx scripts/demo-live-feed.ts",
     "demo:preipo": "tsx scripts/demo-preipo.ts",
-    "demo:comps": "tsx scripts/demo-comps.ts"
+    "demo:comps": "tsx scripts/demo-comps.ts",
+    "demo:hype": "tsx scripts/demo-hype.ts"
   },
   "dependencies": {
     "ethers": "^6.13.1"

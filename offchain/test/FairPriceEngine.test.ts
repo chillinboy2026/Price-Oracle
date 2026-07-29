@@ -4,12 +4,21 @@ import { MarketSession } from "../src/types.js";
 
 const WIDE_OPEN_GUARDRAILS = { maxDeviationBpsLive: 10_000, maxDeviationBpsOffHours: 10_000 };
 
+/** Threshold above any skew these tests use, so order flow contributes nothing
+ * and each test isolates the behaviour it is actually about. */
+const NO_PRESSURE = {
+  thresholdBps: 1_000_000,
+  saturationBps: 3_000,
+  marketShareOfBandBps: 6_000,
+  maxDisplacementBpsNoAnchor: 0,
+};
+
 function baseConfig(overrides: Partial<FairPriceEngineConfig> = {}): FairPriceEngineConfig {
   return {
     guardrails: { maxDeviationBpsLive: 200, maxDeviationBpsOffHours: 50 },
     liveBlendWeight: 0.5,
     offHoursVolatilityBpsPerTick: 5,
-    skewInfluenceBps: 20,
+    marketPressure: NO_PRESSURE,
     reconciliationSteps: 0,
     ...overrides,
   };
@@ -17,7 +26,7 @@ function baseConfig(overrides: Partial<FairPriceEngineConfig> = {}): FairPriceEn
 
 describe("FairPriceEngine", () => {
   it("blends toward a live quote but clamps to the LIVE guardrail", () => {
-    const engine = new FairPriceEngine(100, baseConfig({ skewInfluenceBps: 0 }), 1_000);
+    const engine = new FairPriceEngine(100, baseConfig(), 1_000);
     const result = engine.tick({ liveQuote: { price: 110, timestamp: 1_010 }, inventorySkewBps: 0, now: 1_010 });
 
     // Raw 50/50 blend of 100 and 110 is 105, a 5% move -- clamped to the 2% LIVE cap.
@@ -28,7 +37,7 @@ describe("FairPriceEngine", () => {
   it("drifts off-hours but clamps to the tighter OFF_HOURS guardrail", () => {
     const engine = new FairPriceEngine(
       100,
-      baseConfig({ offHoursVolatilityBpsPerTick: 1000, skewInfluenceBps: 0, random: () => 1 }),
+      baseConfig({ offHoursVolatilityBpsPerTick: 1000, random: () => 1 }),
       1_000
     );
     const result = engine.tick({ liveQuote: null, inventorySkewBps: 0, now: 1_010 });
@@ -38,28 +47,32 @@ describe("FairPriceEngine", () => {
     expect(result.price).toBeCloseTo(100.5, 6);
   });
 
-  it("nudges price down when traders are net long and up when net short", () => {
+  it("raises price on excess demand and lowers it on excess supply", () => {
     const config = baseConfig({
       guardrails: WIDE_OPEN_GUARDRAILS,
       offHoursVolatilityBpsPerTick: 0,
-      skewInfluenceBps: 100,
-      random: () => 0.5, // zero synthetic step, isolates the skew effect
+      random: () => 0.5, // zero synthetic step, isolates order flow
+      marketPressure: {
+        thresholdBps: 1_000,
+        saturationBps: 3_000,
+        marketShareOfBandBps: 6_000,
+        maxDisplacementBpsNoAnchor: 100,
+      },
     });
 
-    const long = new FairPriceEngine(100, config, 1_000);
-    const longResult = long.tick({ liveQuote: null, inventorySkewBps: 5_000, now: 1_010 });
-    expect(longResult.price).toBeCloseTo(99.5, 6);
+    // Traders net long is excess demand, and a clearing market prices that up.
+    // Discouraging the crowded side is the vault fee's job, not the mid's.
+    const demand = new FairPriceEngine(100, config, 1_000);
+    expect(demand.tick({ liveQuote: null, inventorySkewBps: 5_000, now: 1_010 }).price).toBeGreaterThan(100);
 
-    const short = new FairPriceEngine(100, config, 1_000);
-    const shortResult = short.tick({ liveQuote: null, inventorySkewBps: -5_000, now: 1_010 });
-    expect(shortResult.price).toBeCloseTo(100.5, 6);
+    const supply = new FairPriceEngine(100, config, 1_000);
+    expect(supply.tick({ liveQuote: null, inventorySkewBps: -5_000, now: 1_010 }).price).toBeLessThan(100);
   });
 
   it("ramps blend aggressiveness gradually over reconciliationSteps after a reopen", () => {
     const config = baseConfig({
       guardrails: WIDE_OPEN_GUARDRAILS,
       liveBlendWeight: 0.8,
-      skewInfluenceBps: 0,
       reconciliationSteps: 4,
     });
     const engine = new FairPriceEngine(100, config, 1_000);
@@ -82,7 +95,7 @@ describe("FairPriceEngine", () => {
   });
 
   it("syncTo re-anchors state so the next tick blends from the canonical price", () => {
-    const engine = new FairPriceEngine(100, baseConfig({ skewInfluenceBps: 0 }), 1_000);
+    const engine = new FairPriceEngine(100, baseConfig(), 1_000);
     engine.syncTo(150, 2_000, MarketSession.LIVE, 7n);
     expect(engine.getState().price).toBe(150);
     expect(engine.getState().nonce).toBe(7n);

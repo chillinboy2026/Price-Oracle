@@ -123,7 +123,12 @@ const engineConfig: FairPriceEngineConfig = {
   guardrails: { maxDeviationBpsLive: 200, maxDeviationBpsOffHours: 200 },
   liveBlendWeight: 0.5,
   offHoursVolatilityBpsPerTick: 4,
-  skewInfluenceBps: 300,
+  marketPressure: {
+    thresholdBps: 1000,
+    saturationBps: 3_000,
+    marketShareOfBandBps: 6_000,
+    maxDisplacementBpsNoAnchor: 100,
+  },
   reconciliationSteps: 0,
   anchorPullPerTick: 0.05,
   random: mulberry32(21),
@@ -141,20 +146,23 @@ for (let day = 0; day <= 547; day++) {
   const index = basket.value(constituentPricesAt(day, priceRng))!.value;
   const trueFairValue = SERIES_D_COMMON * (1 + 1.3 * (sectorPathAt(day) - 1));
 
-  // Order flow leans toward wherever fair value sits relative to the mark,
-  // which is what a real market's traders would do.
-  const staticSkew = staticEngine.getState().price < trueFairValue ? -4_000 : 4_000;
-  const compsSkew = compsEngine.getState().price < trueFairValue ? -4_000 : 4_000;
+  // Traders lean long when the mark looks cheap against fair value and short
+  // when it looks rich -- and positive skew (net long / excess demand) raises
+  // the price, as a clearing market does.
+  const staticSkew = staticEngine.getState().price < trueFairValue ? 4_000 : -4_000;
+  const compsSkew = compsEngine.getState().price < trueFairValue ? 4_000 : -4_000;
 
   staticEngine.tick({
     liveQuote: null,
     inventorySkewBps: staticSkew,
+    smoothedSkewBps: staticSkew,
     now,
     anchor: staticBook.getReference(now)!,
   });
   compsEngine.tick({
     liveQuote: null,
     inventorySkewBps: compsSkew,
+    smoothedSkewBps: compsSkew,
     now,
     anchor: compsBook.getReference(now, index)!,
   });

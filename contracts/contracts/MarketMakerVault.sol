@@ -60,6 +60,10 @@ contract MarketMakerVault is AccessControl, Pausable, ReentrancyGuard {
         uint16 maintenanceMarginBps; // of notional; below this equity, position is liquidatable
         uint16 liquidationPenaltyBps; // of notional, taken from the liquidated position's residual equity
         uint16 liquidatorShareBps; // share of the penalty paid to the keeper; remainder to the MM
+        // Seconds over which inventory skew is smoothed into the demand signal
+        // the pricing engine consumes. Longer means only more sustained
+        // positioning can influence price. 0 disables smoothing.
+        uint32 skewSmoothingWindow;
     }
 
     VaultConfig public config;
@@ -77,6 +81,9 @@ contract MarketMakerVault is AccessControl, Pausable, ReentrancyGuard {
     uint256 public cumulativeShortfall;
 
     int256 public netNotional; // signed: positive = traders net long, MM net short
+
+    int256 public smoothedSkewBps; // time-smoothed demand signal; see getSmoothedSkewBps
+    uint256 public lastSkewUpdateAt;
 
     struct Position {
         address trader;
@@ -188,6 +195,9 @@ contract MarketMakerVault is AccessControl, Pausable, ReentrancyGuard {
 
     function depositLiquidity(uint256 amount) external onlyRole(MARKET_MAKER_ROLE) {
         if (amount == 0) revert ZeroAmount();
+        // Skew is measured relative to liquidity, so changing liquidity changes
+        // it even with no trade; bank the old level first.
+        _accrueSmoothedSkew();
         quoteToken.safeTransferFrom(msg.sender, address(this), amount);
         totalLiquidity += amount;
         emit LiquidityDeposited(msg.sender, amount);
@@ -197,6 +207,7 @@ contract MarketMakerVault is AccessControl, Pausable, ReentrancyGuard {
         if (amount == 0) revert ZeroAmount();
         uint256 available = availableLiquidity();
         if (amount > available) revert InsufficientAvailableLiquidity(amount, available);
+        _accrueSmoothedSkew();
         totalLiquidity -= amount;
         quoteToken.safeTransfer(msg.sender, amount);
         emit LiquidityWithdrawn(msg.sender, amount);
@@ -236,6 +247,62 @@ contract MarketMakerVault is AccessControl, Pausable, ReentrancyGuard {
         if (raw > cap) return cap;
         if (raw < -cap) return -cap;
         return raw;
+    }
+
+    /// @notice Time-smoothed inventory skew: the number the pricing engine
+    /// should read, rather than the instantaneous `getInventorySkewBps()`.
+    ///
+    /// Instantaneous skew is a poor demand signal because it is trivially
+    /// spikeable -- one large position opened and closed minutes later would
+    /// register as demand identical to a thousand traders holding for a month.
+    /// Smoothing over `skewSmoothingWindow` means only *sustained* positioning
+    /// accumulates, so a flash of one-sided flow decays away before it can move
+    /// the published price.
+    ///
+    /// It lives on-chain rather than in each reporter's memory for a specific
+    /// reason: reporters must agree on a single price to threshold-sign. If
+    /// each kept its own local moving average, nodes that started at different
+    /// times would hold different states and could never converge. Reading one
+    /// objective on-chain number keeps them deterministic, and makes the demand
+    /// input to the price as auditable as the price itself.
+    ///
+    /// The view is pure so it stays correct without anyone poking it: it
+    /// advances the stored value to `block.timestamp` on read.
+    function getSmoothedSkewBps() public view returns (int256) {
+        int256 current = getInventorySkewBps();
+
+        // Checked first: with smoothing off there is no stored state to
+        // consult, and deferring this behind the elapsed-time checks would
+        // return a stale value for a whole block after any trade.
+        uint256 window = config.skewSmoothingWindow;
+        if (window == 0) return current;
+
+        if (lastSkewUpdateAt == 0) return current;
+
+        uint256 elapsed = block.timestamp - lastSkewUpdateAt;
+        if (elapsed == 0) return smoothedSkewBps;
+        if (elapsed >= window) return current;
+
+        // Weight the move toward current skew by the fraction of the smoothing
+        // window that has elapsed: a discrete EMA with time-proportional alpha.
+        int256 weight = int256((elapsed * BPS_DENOMINATOR) / window);
+        return smoothedSkewBps + ((current - smoothedSkewBps) * weight) / int256(BPS_DENOMINATOR);
+    }
+
+    /// @dev Folds elapsed time into the stored smoothed skew. Called before any
+    /// change to `netNotional` or `totalLiquidity`, so the average always
+    /// reflects the skew that actually prevailed over each interval rather than
+    /// jumping to the post-trade value retroactively.
+    function _accrueSmoothedSkew() internal {
+        smoothedSkewBps = getSmoothedSkewBps();
+        lastSkewUpdateAt = block.timestamp;
+    }
+
+    /// @notice Advances the smoothed skew without trading. Permissionless: an
+    /// asset can sit untraded for long stretches, and without this the stored
+    /// value would only ever update on the next trade.
+    function pokeSkew() external {
+        _accrueSmoothedSkew();
     }
 
     /// @notice Fee (in bps of notional) a trade in direction `isLong` would pay
@@ -351,6 +418,9 @@ contract MarketMakerVault is AccessControl, Pausable, ReentrancyGuard {
         uint256 reserve = (netMargin * (config.maxPayoutMultipleBps - BPS_DENOMINATOR)) / BPS_DENOMINATOR;
         uint256 available = availableLiquidity();
         if (reserve > available) revert InsufficientAvailableLiquidity(reserve, available);
+
+        // Bank the pre-trade skew before this position changes it.
+        _accrueSmoothedSkew();
 
         feesAccrued += fee;
         totalMargin += netMargin;
@@ -469,6 +539,10 @@ contract MarketMakerVault is AccessControl, Pausable, ReentrancyGuard {
     // ---------------------------------------------------------------------
 
     function _releasePosition(uint256 positionId, Position memory position) internal {
+        // Bank the skew that prevailed up to this instant before unwinding the
+        // position, so the smoothed average credits the period the exposure was
+        // actually open rather than retroactively erasing it.
+        _accrueSmoothedSkew();
         positions[positionId].open = false;
         reservedLiquidity -= position.reserved;
         netNotional -= position.isLong ? int256(position.notional) : -int256(position.notional);
