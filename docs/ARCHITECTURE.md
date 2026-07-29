@@ -200,6 +200,78 @@ input into the next price attestation (see below) -- real trading pressure
 against the vault feeds back into the fair-price model, particularly useful
 off-hours when there's no live market to react to instead.
 
+### `offchain/src/feeds/` -- the live market feed
+
+`LiveFeed` is a one-method interface (`quote(now)` returns a price or `null`),
+with two implementations:
+
+- **`AggregatedLiveFeed`** -- the real one. Polls several public crypto
+  exchanges at once (Coinbase, Kraken, Gemini, Bitstamp, Binance) via keyless
+  REST endpoints and aggregates them.
+- **`MockLiveFeed`** -- the simulated equity-hours random walk, kept for
+  offline development and for exercising the closed-market path.
+
+Selected by `FEED_MODE` (`crypto` by default). Crypto is the pragmatic
+starting point: no API keys, no data licence, and 24/7 trading. Real-time
+*equity* data is the harder problem, and it is a licensing problem more than
+a technical one -- most vendors' redistribution terms do not permit
+republishing prices on-chain. Adding an equities vendor means writing one
+more `ExchangeAdapter`; the rest of the system does not change.
+
+#### Aggregation and manipulation resistance
+
+A single exchange is a single point of manipulation, so the feed never
+trusts one. Each poll:
+
+1. Queries every venue in parallel (`Promise.allSettled`, so one hanging
+   venue cannot stall the round), with a per-attempt timeout and bounded
+   retries. 5xx and 429 are retried; other 4xx are not, since retrying a
+   malformed request just burns rate limit.
+2. Prices each venue at its **bid/ask midpoint** rather than its last trade.
+   A single print can be walked by a small trade; moving the midpoint
+   requires standing in the book on both sides.
+3. **Drops venues with a blown-out spread** (`maxSpreadBps`) -- a wide book
+   signals thin or broken liquidity whose midpoint is cheap to move.
+4. **Drops outliers**: take a provisional median, discard venues further
+   than `maxDeviationBps` from it, then re-median the survivors.
+5. **Requires a quorum** (`minSources`). Below it, the feed publishes
+   nothing rather than a weakly-sourced price.
+
+The security property this buys is precise, and worth stating exactly: a
+single compromised venue *cannot move the published price meaningfully*, and
+critically, **lying harder buys the attacker nothing** -- once a venue is
+outside the outlier band its print is discarded outright, so a 50x lie and a
+5,000,000x lie have identical (zero) effect. Removing a venue from the set
+does shift the median slightly, but that shift is bounded by the dispersion
+between *honest* venues, not by the size of the lie. Both properties are
+asserted in `test/AggregatedLiveFeed.test.ts`.
+
+#### Degradation is the off-hours path
+
+Polling happens on its own schedule and `quote()` reads a cached snapshot,
+which keeps the engine's tick rate decoupled from exchange rate limits and
+lets the engine stay a pure synchronous function of its inputs. If the cache
+goes older than `maxQuoteAgeMs`, or a poll cannot reach quorum for long
+enough, `quote()` returns `null`.
+
+That `null` is the same signal a closed equity market produces. So a crypto
+exchange outage degrades along *exactly* the same path as an overnight
+equity session: the engine falls back to its bounded synthetic model and the
+oracle contract applies its tighter off-hours guardrail, with no
+special-casing anywhere. `MarketSession.OFF_HOURS` is really "no trustworthy
+live reference right now", and closed markets are just one cause of it.
+
+#### A caveat worth stating: the USDT basis
+
+Binance's deep USD-ish books are quoted in USDT, not USD. That is a
+different instrument -- USDT has depegged by tens of bps historically, and
+much further under stress -- so this venue is not measuring quite the same
+thing as the USD-quoted venues. It is included because its depth makes it
+expensive to manipulate. The outlier filter will drop it automatically
+during a serious depeg, which handles the tail but *not* the steady-state
+basis. A production deployment should either price the USDT/USD leg
+explicitly or weight this venue down.
+
 ### `offchain/src/engine/FairPriceEngine.ts`
 
 The actual pricing algorithm, run independently by every reporter node.
@@ -294,6 +366,9 @@ resumes around the new level.
 
 | Vector | Mitigation |
 |---|---|
+| Single exchange compromised or broken | Cross-venue median with outlier + spread rejection; a more extreme lie buys no extra influence |
+| Feeding off a single venue's last trade | Priced off bid/ask midpoint, which requires standing in the book to move |
+| All venues unreachable / feed silently dies | Quorum requirement + cache staleness horizon; degrades to the off-hours model, never serves an indefinitely stale price |
 | Single reporter goes rogue | Threshold multi-sig; one signer can't move the price |
 | Reporter feeds a stale price | On-chain staleness + future-timestamp checks |
 | Replay / out-of-order update | Strictly increasing nonce |
@@ -334,8 +409,17 @@ deliberate simplifications:
   leaving no economic reason to call `liquidate()` on exactly the positions
   that most need it. A minimum reward funded from the MM's side would fix
   this.
-- **`MockLiveFeed` is a random walk, not a real data source.** Swapping in
-  a real feed only means implementing the two-method `LiveFeed` interface.
+- **Crypto venues only, so far.** The live feed covers public crypto spot
+  markets. Equities/RWAs need a licensed vendor (see the feeds section
+  above); pre-IPO has no feed to integrate at all and runs on the
+  guardian-anchored path described below.
+- **No volume weighting.** Aggregation treats a venue with $1bn of depth and
+  one with $1m identically. Volume- or depth-weighting the median would make
+  it meaningfully harder to influence, at the cost of trusting each venue's
+  self-reported volume.
+- **Feed adapters are polled over REST, not streamed.** Websocket feeds
+  would cut latency substantially; REST polling was chosen for simplicity
+  and because the oracle publishes on a slower cadence than it polls anyway.
 - **No non-EVM adapter yet** -- the design leaves room for one (see above)
   but none is implemented here.
 - **Off-chain -> on-chain wiring for `getInventorySkewBps()`** is stubbed

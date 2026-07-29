@@ -6,7 +6,8 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "test": "vitest run",
-    "dev": "tsx src/index.ts"
+    "dev": "tsx src/index.ts",
+    "demo": "tsx scripts/demo-live-feed.ts"
   },
   "dependencies": {
     "ethers": "^6.13.1"

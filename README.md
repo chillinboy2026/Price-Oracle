@@ -38,11 +38,41 @@ pnpm contracts:test
 # Off-chain engine: run the vitest suite
 pnpm offchain:test
 
-# Run the off-chain orchestrator locally (dry-run: logs what it would
-# publish on-chain; set RPC_URL/ORACLE_ADDRESS/PUBLISHER_PRIVATE_KEY to
-# actually publish to a deployed PriceOracle)
+# End-to-end demo of the live-feed pipeline against local venues speaking
+# each exchange's real response shape. Needs no network and no API keys --
+# shows normal aggregation, an outlier venue being discarded, and the feed
+# losing quorum and degrading to the off-hours model.
+pnpm --filter ./offchain demo
+
+# Run the off-chain orchestrator locally against real crypto exchanges
+# (dry-run: logs what it would publish on-chain; set RPC_URL /
+# ORACLE_ADDRESS / PUBLISHER_PRIVATE_KEY to actually publish)
 cd offchain && pnpm dev
 ```
+
+### Live feed configuration
+
+`pnpm dev` polls real public exchange endpoints by default — no API keys and
+no data licence required.
+
+| Env var | Default | Meaning |
+|---|---|---|
+| `FEED_MODE` | `crypto` | `crypto` polls real exchanges; `mock` runs the simulated equity-hours walk |
+| `FEED_SYMBOL` | `BTC-USD` | Canonical symbol (`BTC-USD`, `ETH-USD`, `SOL-USD`) |
+| `FEED_MIN_SOURCES` | `3` | Venues that must agree before any price is published |
+| `FEED_POLL_INTERVAL_MS` | `5000` | Exchange poll cadence (governs rate limiting) |
+| `TICK_INTERVAL_MS` | `10000` | How often the oracle publishes, independent of polling |
+| `VERBOSE_FEED` | unset | Set to `1` to log every successful aggregation |
+
+If fewer than `FEED_MIN_SOURCES` venues respond, the feed reports no quote
+rather than a weakly-sourced one, and the system degrades to the same
+bounded off-hours model a closed equity market would use.
+
+Note on sandboxed environments: if outbound HTTPS to exchange hosts is
+blocked by an egress policy, `pnpm dev` will report every venue failing and
+fall back to the off-hours model — that is the designed outage behavior, not
+a bug. Use `pnpm --filter ./offchain demo` to exercise the full live path
+without network access.
 
 Note on compiling contracts in this environment: `contracts/scripts/compile.cjs`
 compiles with the `solc` npm package (pinned in `contracts/package.json`)
@@ -56,11 +86,12 @@ pinned solc version from `hardhat.config.ts`.
 ## Status
 
 This is a working skeleton of every core piece (on-chain oracle +
-guardrails, leveraged market-maker vault with liquidations, off-chain
-engine + reporter network simulation), not a production system. 61 tests
-pass across both packages. See "Known simplifications and next steps" in
-the architecture doc for what's deliberately left out -- notably funding
-rates, multi-LP share accounting, and partial liquidations.
+guardrails, leveraged market-maker vault with liquidations, multi-exchange
+live feed, off-chain engine + reporter network simulation), not a
+production system. 85 tests pass across both packages. See "Known
+simplifications and next steps" in the architecture doc for what's
+deliberately left out -- notably funding rates, multi-LP share accounting,
+partial liquidations, and volume-weighted feed aggregation.
 
 None of this has been through a security audit, and the economic
 parameters (fee levels, maintenance margin, payout caps) are illustrative
