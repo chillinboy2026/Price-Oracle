@@ -1,0 +1,17 @@
+{
+  "name": "price-oracle",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Chain-agnostic fair-market price oracle for real world assets and pre-IPO markets",
+  "workspaces": [
+    "contracts",
+    "offchain"
+  ],
+  "scripts": {
+    "contracts:build": "pnpm --filter ./contracts run build",
+    "contracts:test": "pnpm --filter ./contracts run test",
+    "offchain:build": "pnpm --filter ./offchain run build",
+    "offchain:test": "pnpm --filter ./offchain run test",
+    "test": "pnpm run contracts:test && pnpm run offchain:test"
+  }
+}
