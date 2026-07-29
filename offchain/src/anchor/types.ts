@@ -52,6 +52,10 @@ export interface AnchorEvent {
   impliedValuation?: number;
   /** Half-width of the acceptable band at t=0, in bps. */
   bandBps: number;
+  /** Level of the public comparables index when this event took effect.
+   * Recorded so the band can later be recentered by how far comps have moved
+   * since; omitting it disables comps tracking for this anchor. */
+  compIndexAtEffective?: number;
   /** Hash/CID of the supporting document. */
   documentHash?: string;
 }

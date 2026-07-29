@@ -17,6 +17,7 @@ export interface AnchorAttestation {
   effectiveAt: bigint;
   impliedValuation: bigint;
   bandBps: bigint;
+  compIndexAtEffective: bigint;
   documentHash: string;
   nonce: bigint;
 }
@@ -30,6 +31,7 @@ export const ANCHOR_TYPES: Record<string, TypedDataField[]> = {
     { name: "effectiveAt", type: "uint256" },
     { name: "impliedValuation", type: "uint256" },
     { name: "bandBps", type: "uint256" },
+    { name: "compIndexAtEffective", type: "uint256" },
     { name: "documentHash", type: "bytes32" },
     { name: "nonce", type: "uint256" },
   ],

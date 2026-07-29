@@ -10,6 +10,7 @@ export interface SolidityAnchorAttestation {
   effectiveAt: bigint;
   impliedValuation: bigint;
   bandBps: bigint;
+  compIndexAtEffective: bigint;
   documentHash: string;
   nonce: bigint;
 }
@@ -25,6 +26,7 @@ export const ANCHOR_ATTESTATION_TYPES: Record<string, TypedDataField[]> = {
     { name: "effectiveAt", type: "uint256" },
     { name: "impliedValuation", type: "uint256" },
     { name: "bandBps", type: "uint256" },
+    { name: "compIndexAtEffective", type: "uint256" },
     { name: "documentHash", type: "bytes32" },
     { name: "nonce", type: "uint256" },
   ],
@@ -48,6 +50,7 @@ export function toSolidityAnchorAttestation(
     effectiveAt: BigInt(event.effectiveAt),
     impliedValuation: parseUnits((event.impliedValuation ?? 0).toFixed(18), 18),
     bandBps: BigInt(Math.round(event.bandBps)),
+    compIndexAtEffective: parseUnits((event.compIndexAtEffective ?? 0).toFixed(18), 18),
     documentHash: event.documentHash ?? ZeroHash,
     nonce,
   };

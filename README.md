@@ -23,8 +23,9 @@ See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full design.
 contracts/   Solidity: PriceOracle, MarketMakerVault (leverage + liquidation),
              AnchorRegistry (pre-IPO valuation anchors)
 offchain/    TypeScript: fair-price engine, multi-exchange live feed,
-             cap-table/waterfall math, anchor book, EIP-712 signers,
-             reporter-node simulation, on-chain publisher
+             cap-table/waterfall math, anchor book, comparables basket +
+             beta estimation, EIP-712 signers, reporter-node simulation,
+             on-chain publisher
 docs/        Architecture write-up
 ```
 
@@ -49,6 +50,11 @@ pnpm --filter ./offchain demo
 # waterfall -> common price -> anchor + band -> order flow inside the band
 # -> band widening with age -> a new anchor resetting it.
 pnpm --filter ./offchain demo:preipo
+
+# Comparables tracking: estimate beta to a public SaaS basket, then run an
+# 18-month Series-D-to-IPO simulation comparing a static anchor against a
+# comps-tracked one.
+pnpm --filter ./offchain demo:comps
 
 # Run the off-chain orchestrator locally against real crypto exchanges
 # (dry-run: logs what it would publish on-chain; set RPC_URL /
@@ -93,15 +99,17 @@ pinned solc version from `hardhat.config.ts`.
 
 This is a working skeleton of every core piece (on-chain oracle +
 guardrails, leveraged market-maker vault with liquidations, multi-exchange
-live feed, pre-IPO anchor registry with cap-table math, off-chain engine +
-reporter network simulation), not a production system. 133 tests pass
-across both packages.
+live feed, pre-IPO anchor registry with cap-table math and comparables
+tracking, off-chain engine + reporter network simulation), not a production
+system. 166 tests pass across both packages.
 
 See "Known simplifications and next steps" in the architecture doc for
 what's deliberately left out -- notably funding rates, multi-LP share
 accounting, partial liquidations, volume-weighted feed aggregation, and a
 real option-pricing-model valuation (the cap-table math is a labelled
-approximation, not a 409A).
+approximation, not a 409A). The comparables model's beta and basket are
+configured inputs, and choosing them well is an empirical problem this repo
+does not solve.
 
 None of this has been through a security audit, and the economic parameters
 (fee levels, maintenance margin, payout caps, band widths) are illustrative

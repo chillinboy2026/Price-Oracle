@@ -23,8 +23,11 @@ function config(overrides: Partial<FairPriceEngineConfig> = {}): FairPriceEngine
 }
 
 function reference(overrides: Partial<AnchorReference> = {}): AnchorReference {
+  const price = overrides.price ?? 20;
   return {
-    price: 20,
+    price,
+    anchorPrice: price,
+    compAdjustment: 1,
     bandBps: 1_500,
     confidenceBps: 500,
     ageDays: 0,

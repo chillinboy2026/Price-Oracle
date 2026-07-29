@@ -48,6 +48,12 @@ library AnchorAttestationLib {
         uint256 impliedValuation;
         /// Half-width of the acceptable band around this anchor at t=0, in bps.
         uint256 bandBps;
+        /// Level of the public comparables index at `effectiveAt`, 1e18.
+        /// Recorded so the band can later be recentered by how far comps have
+        /// moved *since this event*. Without it the comps adjustment would have
+        /// no verifiable origin and could be rebased at will. Zero disables
+        /// comps tracking for this anchor.
+        uint256 compIndexAtEffective;
         /// Hash of the source document (term sheet, 409A report, tender notice)
         /// so the attestation is auditable against evidence rather than being
         /// a bare number someone asserted.
@@ -57,7 +63,7 @@ library AnchorAttestationLib {
 
     bytes32 internal constant ANCHOR_ATTESTATION_TYPEHASH =
         keccak256(
-            "AnchorAttestation(bytes32 assetId,uint8 kind,uint256 pricePerShare,bytes32 shareClass,uint256 effectiveAt,uint256 impliedValuation,uint256 bandBps,bytes32 documentHash,uint256 nonce)"
+            "AnchorAttestation(bytes32 assetId,uint8 kind,uint256 pricePerShare,bytes32 shareClass,uint256 effectiveAt,uint256 impliedValuation,uint256 bandBps,uint256 compIndexAtEffective,bytes32 documentHash,uint256 nonce)"
         );
 
     function hashStruct(AnchorAttestation memory attestation) internal pure returns (bytes32) {
@@ -72,6 +78,7 @@ library AnchorAttestationLib {
                     attestation.effectiveAt,
                     attestation.impliedValuation,
                     attestation.bandBps,
+                    attestation.compIndexAtEffective,
                     attestation.documentHash,
                     attestation.nonce
                 )

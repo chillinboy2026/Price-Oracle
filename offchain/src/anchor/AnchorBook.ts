@@ -1,3 +1,4 @@
+import { compsAdjustmentFactor } from "../comps/beta.js";
 import { AnchorEvent, AnchorKind } from "./types.js";
 
 const SECONDS_PER_DAY = 86_400;
@@ -44,12 +45,23 @@ export interface AnchorBookConfig {
    * propose prices the contract rejects. */
   maxBandBps: number;
   maxConfidenceBps: number;
+  /** Sensitivity to the comparables index, in bps (10000 = 1:1). Must match
+   * the on-chain `betaBps`. */
+  betaBps?: number;
+  /** Cap on how far comps alone may move the band center, in bps. Must match
+   * the on-chain `maxCompAdjustmentBps`. */
+  maxCompAdjustmentBps?: number;
   profiles?: Partial<Record<AnchorKind, AnchorKindProfile>>;
 }
 
 export interface AnchorReference {
-  /** The anchored fair value the engine mean-reverts toward. */
+  /** The anchored fair value the engine mean-reverts toward: the anchor price
+   * carried forward by comparables. */
   price: number;
+  /** The raw anchor price, before any comps adjustment. */
+  anchorPrice: number;
+  /** Multiplier comps contributed, 1 when comps tracking is inactive. */
+  compAdjustment: number;
   /** Half-width of the band the price may occupy around `price`, in bps. */
   bandBps: number;
   /** Reported confidence half-width, in bps. */
@@ -109,10 +121,19 @@ export class AnchorBook {
     return this.profiles[kind];
   }
 
-  /** Resolves the current anchored reference, or null if nothing has anchored
+  /**
+   * Resolves the current anchored reference, or null if nothing has anchored
    * yet (in which case the engine is unconstrained and the on-chain registry
-   * likewise imposes no band). */
-  getReference(now: number): AnchorReference | null {
+   * likewise imposes no band).
+   *
+   * `compIndexNow` is the current level of the public comparables index. When
+   * supplied -- and when the anchor recorded the index level at its effective
+   * date -- the reference is recentered by how far comps have moved since,
+   * scaled by beta. This reproduces `AnchorRegistry.currentCenter()` exactly,
+   * including the clamp, so the engine never proposes a price the contract
+   * would reject.
+   */
+  getReference(now: number, compIndexNow?: number): AnchorReference | null {
     const anchor = this.getLatest(now);
     if (!anchor) return null;
 
@@ -129,12 +150,33 @@ export class AnchorBook {
       profile.baseConfidenceBps + ageDays * profile.wideningBpsPerDay
     );
 
-    return { price: anchor.pricePerShare, bandBps, confidenceBps, ageDays, kind: anchor.kind };
+    const compAdjustment =
+      compIndexNow !== undefined &&
+      anchor.compIndexAtEffective !== undefined &&
+      anchor.compIndexAtEffective > 0
+        ? compsAdjustmentFactor(
+            compIndexNow,
+            anchor.compIndexAtEffective,
+            this.config.betaBps ?? 0,
+            this.config.maxCompAdjustmentBps ?? 0
+          )
+        : 1;
+
+    return {
+      price: anchor.pricePerShare * compAdjustment,
+      anchorPrice: anchor.pricePerShare,
+      compAdjustment,
+      bandBps,
+      confidenceBps,
+      ageDays,
+      kind: anchor.kind,
+    };
   }
 
-  /** Bounds the price may occupy right now. */
-  getBand(now: number): { lower: number; upper: number } | null {
-    const reference = this.getReference(now);
+  /** Bounds the price may occupy right now, centered on the comps-adjusted
+   * reference. */
+  getBand(now: number, compIndexNow?: number): { lower: number; upper: number } | null {
+    const reference = this.getReference(now, compIndexNow);
     if (!reference) return null;
     return {
       lower: reference.price * (1 - reference.bandBps / 10_000),

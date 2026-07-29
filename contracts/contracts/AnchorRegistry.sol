@@ -6,6 +6,7 @@ import {EIP712} from "@openzeppelin/contracts/utils/cryptography/EIP712.sol";
 import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 
 import {IAnchorBand} from "./interfaces/IAnchorBand.sol";
+import {IPriceOracle} from "./interfaces/IPriceOracle.sol";
 import {AnchorAttestationLib} from "./libraries/AnchorAttestationLib.sol";
 
 /// @title AnchorRegistry
@@ -38,6 +39,21 @@ import {AnchorAttestationLib} from "./libraries/AnchorAttestationLib.sol";
 /// ages, so a stale anchor constrains the price loosely rather than pinning it
 /// to a number nobody believes any more -- while still bounding it, since
 /// `maxBandBps` caps how far the band can ever open.
+///
+/// Comparables tracking: widening alone treats the intervening time as pure
+/// ignorance, which overstates the case. What is unobservable between anchors
+/// is *this company's* execution; what is very observable is the valuation
+/// multiple the public market pays for companies like it, and sector rerating
+/// is a large part of what moves private marks between rounds. So the band does
+/// not merely widen around a fixed point -- it *travels*, recentered by how far
+/// a public comparables index has moved since the anchor's effective date,
+/// scaled by the asset's beta to that index.
+///
+/// The comparables index is read from a PriceOracle as an ordinary asset. That
+/// is the point: the index is itself computed by the same reporter network and
+/// published under the same threshold-signature and guardrail rules as any
+/// other price, so the recentering is verifiable on-chain end to end rather
+/// than being an off-chain claim about where comps went.
 contract AnchorRegistry is IAnchorBand, AccessControl, EIP712 {
     using ECDSA for bytes32;
 
@@ -58,6 +74,17 @@ contract AnchorRegistry is IAnchorBand, AccessControl, EIP712 {
         /// An anchor attesting a different class is rejected, so a preferred
         /// round price can never be silently applied as a common price.
         bytes32 shareClass;
+        /// Asset id of the public comparables index in `priceOracle`.
+        /// bytes32(0) disables comps tracking, leaving a static band.
+        bytes32 compIndexAssetId;
+        /// Sensitivity to the comps index, in bps: 10000 = moves 1:1 with the
+        /// basket, 15000 = 1.5x. Signed, though a negative beta to one's own
+        /// sector would be unusual enough to warrant scrutiny.
+        int32 betaBps;
+        /// Hard cap on how far comps alone may move the band's center, in bps.
+        /// Bounds both the linearization error and the blast radius of a bad
+        /// index print.
+        uint32 maxCompAdjustmentBps;
     }
 
     struct StoredAnchor {
@@ -68,6 +95,7 @@ contract AnchorRegistry is IAnchorBand, AccessControl, EIP712 {
         uint256 recordedAt;
         uint256 impliedValuation;
         uint256 bandBps;
+        uint256 compIndexAtEffective;
         bytes32 documentHash;
         uint256 lastNonce;
     }
@@ -84,6 +112,7 @@ contract AnchorRegistry is IAnchorBand, AccessControl, EIP712 {
         uint256 effectiveAt,
         uint256 impliedValuation,
         uint256 bandBps,
+        uint256 compIndexAtEffective,
         bytes32 documentHash,
         uint8 attestorCount
     );
@@ -97,8 +126,14 @@ contract AnchorRegistry is IAnchorBand, AccessControl, EIP712 {
     error ZeroPrice();
     error InvalidConfig();
 
-    constructor(address admin) EIP712("AnchorRegistry", "1") {
+    /// @notice Source of comparables index prices. Immutable so an asset's
+    /// recentering can never be redirected to a different, friendlier oracle
+    /// after the fact.
+    IPriceOracle public immutable priceOracle;
+
+    constructor(address admin, IPriceOracle _priceOracle) EIP712("AnchorRegistry", "1") {
         _grantRole(DEFAULT_ADMIN_ROLE, admin);
+        priceOracle = _priceOracle;
     }
 
     // ---------------------------------------------------------------------
@@ -124,6 +159,10 @@ contract AnchorRegistry is IAnchorBand, AccessControl, EIP712 {
         if (config.threshold == 0) revert InvalidConfig();
         if (config.maxBandBps == 0 || config.maxBandBps > BPS_DENOMINATOR) revert InvalidConfig();
         if (config.shareClass == bytes32(0)) revert InvalidConfig();
+        // A comp adjustment able to reach or exceed 100% could drive the band
+        // center to zero or negative.
+        if (config.maxCompAdjustmentBps >= BPS_DENOMINATOR) revert InvalidConfig();
+        if (config.compIndexAssetId != bytes32(0) && config.maxCompAdjustmentBps == 0) revert InvalidConfig();
     }
 
     // ---------------------------------------------------------------------
@@ -172,6 +211,7 @@ contract AnchorRegistry is IAnchorBand, AccessControl, EIP712 {
             recordedAt: block.timestamp,
             impliedValuation: attestation.impliedValuation,
             bandBps: attestation.bandBps,
+            compIndexAtEffective: attestation.compIndexAtEffective,
             documentHash: attestation.documentHash,
             lastNonce: attestation.nonce
         });
@@ -183,6 +223,7 @@ contract AnchorRegistry is IAnchorBand, AccessControl, EIP712 {
             attestation.effectiveAt,
             attestation.impliedValuation,
             attestation.bandBps,
+            attestation.compIndexAtEffective,
             attestation.documentHash,
             validAttestors
         );
@@ -206,6 +247,54 @@ contract AnchorRegistry is IAnchorBand, AccessControl, EIP712 {
         return band > config.maxBandBps ? config.maxBandBps : band;
     }
 
+    /// @notice Multiplier applied to the anchor price to reflect how far public
+    /// comparables have moved since the anchor took effect, in bps
+    /// (BPS_DENOMINATOR = no adjustment).
+    ///
+    /// Applied linearly rather than by exponentiation:
+    ///
+    ///   adjustment = 1 + beta * (indexNow / indexAtAnchor - 1)
+    ///
+    /// which is both what beta means under linear-return estimation and the
+    /// only form practical in integer arithmetic. The off-chain
+    /// `compsAdjustmentFactor` reproduces this exactly, including the clamp, so
+    /// the pricing engine never proposes a center the contract disagrees with.
+    ///
+    /// Falls back to no adjustment when comps tracking is disabled, when the
+    /// anchor predates comps tracking, or when the index has never been
+    /// published. That last case is deliberately a soft failure: `checkBand` is
+    /// called inside `updatePrice`, so reverting here would freeze the asset's
+    /// price entirely rather than merely un-tracking comps.
+    function currentCompAdjustmentBps(bytes32 assetId) public view returns (uint256) {
+        AnchorConfig memory config = anchorConfigs[assetId];
+        StoredAnchor memory anchor = anchors[assetId];
+
+        if (config.compIndexAssetId == bytes32(0)) return BPS_DENOMINATOR;
+        if (!anchor.exists || anchor.compIndexAtEffective == 0) return BPS_DENOMINATOR;
+
+        (uint256 indexNow, , ) = priceOracle.getPrice(config.compIndexAssetId);
+        if (indexNow == 0) return BPS_DENOMINATOR;
+
+        int256 ratioBps = int256((indexNow * BPS_DENOMINATOR) / anchor.compIndexAtEffective);
+        int256 deltaBps = ratioBps - int256(BPS_DENOMINATOR);
+        int256 adjustmentBps = int256(BPS_DENOMINATOR) + (int256(config.betaBps) * deltaBps) / int256(BPS_DENOMINATOR);
+
+        int256 lowerBound = int256(BPS_DENOMINATOR) - int256(uint256(config.maxCompAdjustmentBps));
+        int256 upperBound = int256(BPS_DENOMINATOR) + int256(uint256(config.maxCompAdjustmentBps));
+        if (adjustmentBps < lowerBound) adjustmentBps = lowerBound;
+        if (adjustmentBps > upperBound) adjustmentBps = upperBound;
+        // maxCompAdjustmentBps is validated below BPS_DENOMINATOR, so the
+        // clamped result is always strictly positive.
+        return uint256(adjustmentBps);
+    }
+
+    /// @notice The band's center: the anchor price carried forward by comps.
+    function currentCenter(bytes32 assetId) public view returns (uint256) {
+        StoredAnchor memory anchor = anchors[assetId];
+        if (!anchor.exists) return 0;
+        return (anchor.pricePerShare * currentCompAdjustmentBps(assetId)) / BPS_DENOMINATOR;
+    }
+
     /// @inheritdoc IAnchorBand
     /// @dev An asset with no anchor yet is unconstrained rather than frozen:
     /// returning `false` here would deadlock a newly-registered asset, since no
@@ -218,9 +307,10 @@ contract AnchorRegistry is IAnchorBand, AccessControl, EIP712 {
         StoredAnchor memory anchor = anchors[assetId];
         if (!anchor.exists) return (true, 0, type(uint256).max);
 
+        uint256 center = currentCenter(assetId);
         uint256 band = currentBandBps(assetId);
-        lower = (anchor.pricePerShare * (BPS_DENOMINATOR - band)) / BPS_DENOMINATOR;
-        upper = (anchor.pricePerShare * (BPS_DENOMINATOR + band)) / BPS_DENOMINATOR;
+        lower = (center * (BPS_DENOMINATOR - band)) / BPS_DENOMINATOR;
+        upper = (center * (BPS_DENOMINATOR + band)) / BPS_DENOMINATOR;
         ok = price >= lower && price <= upper;
     }
 

@@ -5,10 +5,12 @@
   "type": "module",
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "test": "vitest run",
+    "typecheck": "tsc -p tsconfig.check.json",
+    "test": "tsc -p tsconfig.check.json && vitest run",
     "dev": "tsx src/index.ts",
     "demo": "tsx scripts/demo-live-feed.ts",
-    "demo:preipo": "tsx scripts/demo-preipo.ts"
+    "demo:preipo": "tsx scripts/demo-preipo.ts",
+    "demo:comps": "tsx scripts/demo-comps.ts"
   },
   "dependencies": {
     "ethers": "^6.13.1"

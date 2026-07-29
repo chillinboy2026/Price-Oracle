@@ -20,8 +20,12 @@ describe("AnchorRegistry", function () {
     const [admin, other] = await ethers.getSigners();
     const attestors = [Wallet.createRandom(), Wallet.createRandom(), Wallet.createRandom()];
 
+    const Oracle = await ethers.getContractFactory("PriceOracle", admin);
+    const oracle = await Oracle.deploy(admin.address);
+    await oracle.waitForDeployment();
+
     const Registry = await ethers.getContractFactory("AnchorRegistry", admin);
-    const registry = await Registry.deploy(admin.address);
+    const registry = await Registry.deploy(admin.address, await oracle.getAddress());
     await registry.waitForDeployment();
 
     const ATTESTOR_ROLE = await registry.ATTESTOR_ROLE();
@@ -33,6 +37,9 @@ describe("AnchorRegistry", function () {
       bandWideningBpsPerDay: 10,
       maxBandBps: 5_000, // 50%
       shareClass: COMMON,
+      compIndexAssetId: ethers.ZeroHash,
+      betaBps: 0,
+      maxCompAdjustmentBps: 0,
       ...configOverrides,
     });
 
@@ -56,6 +63,7 @@ describe("AnchorRegistry", function () {
       effectiveAt,
       impliedValuation: 10_000_000_000n * ONE,
       bandBps: 1_500n,
+      compIndexAtEffective: 0n,
       documentHash: ethers.keccak256(ethers.toUtf8Bytes("series-f-term-sheet.pdf")),
       nonce: 1n,
       ...overrides,
@@ -77,6 +85,7 @@ describe("AnchorRegistry", function () {
         effectiveAt,
         10_000_000_000n * ONE,
         1_500n,
+        0n,
         attestation.documentHash,
         2
       );
@@ -221,8 +230,12 @@ describe("PriceOracle bound to an AnchorRegistry", function () {
     const reporters = [Wallet.createRandom(), Wallet.createRandom()];
     const attestors = [Wallet.createRandom(), Wallet.createRandom()];
 
+    const Oracle = await ethers.getContractFactory("PriceOracle", admin);
+    const oracle = await Oracle.deploy(admin.address);
+    await oracle.waitForDeployment();
+
     const Registry = await ethers.getContractFactory("AnchorRegistry", admin);
-    const registry = await Registry.deploy(admin.address);
+    const registry = await Registry.deploy(admin.address, await oracle.getAddress());
     await registry.waitForDeployment();
     const ATTESTOR_ROLE = await registry.ATTESTOR_ROLE();
     for (const a of attestors) await registry.grantRole(ATTESTOR_ROLE, a.address);
@@ -232,11 +245,10 @@ describe("PriceOracle bound to an AnchorRegistry", function () {
       bandWideningBpsPerDay: 10,
       maxBandBps: 5_000,
       shareClass: COMMON,
+      compIndexAssetId: ethers.ZeroHash,
+      betaBps: 0,
+      maxCompAdjustmentBps: 0,
     });
-
-    const Oracle = await ethers.getContractFactory("PriceOracle", admin);
-    const oracle = await Oracle.deploy(admin.address);
-    await oracle.waitForDeployment();
     const REPORTER_ROLE = await oracle.REPORTER_ROLE();
     for (const r of reporters) await oracle.grantRole(REPORTER_ROLE, r.address);
     await oracle.registerAsset(ASSET_ID, {
@@ -277,6 +289,7 @@ describe("PriceOracle bound to an AnchorRegistry", function () {
       effectiveAt: await now(),
       impliedValuation: 0n,
       bandBps: 1_500n,
+      compIndexAtEffective: 0n,
       documentHash: ethers.ZeroHash,
       nonce,
     };

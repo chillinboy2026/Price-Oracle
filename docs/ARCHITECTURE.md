@@ -429,6 +429,58 @@ evidence: a priced round is real money at an arm's-length negotiated price; a
 real trade but information-poor; a recap resets the stack and makes prior
 evidence stale.
 
+### Comparables: the band travels, it doesn't just widen
+
+Widening alone treats the time between anchors as pure ignorance, and that
+overstates the case. What is unobservable is *this company's* execution. What
+is very observable is the valuation multiple the public market pays for
+companies like it — and sector rerating is a large part of what moves private
+marks between rounds.
+
+So the band does not merely widen around a fixed point; it **travels**,
+recentered by how far a public comparables index has moved since the anchor's
+effective date, scaled by the asset's beta to that index:
+
+```
+center = anchorPrice × (1 + beta × (indexNow / indexAtAnchor − 1))
+```
+
+Applied linearly rather than as `(ratio)^beta` — deliberately. Linear is what
+beta means under the linear-return regression that estimates it, and fractional
+exponentiation is impractical in Solidity integer math. Since
+`AnchorRegistry.currentCompAdjustmentBps()` and the off-chain
+`compsAdjustmentFactor()` must agree *exactly* — any divergence means the
+engine proposes prices the contract rejects — the arithmetic has to be
+reproducible on both sides. `maxCompAdjustmentBps` bounds the adjustment, which
+also keeps the linearization inside the range where it approximates well.
+
+This is why a pre-IPO market can converge on an IPO price without seeing it:
+IPO pricing is itself largely a comps exercise, so an oracle tracking the same
+multiple is tracking the same input the bankers will use.
+`pnpm --filter ./offchain demo:comps` runs an 18-month Series-D-to-IPO
+simulation comparing a static anchor against a comps-tracked one.
+
+**The index is published as an ordinary oracle asset.** That is the crux of
+making this verifiable: the comps index is computed by the same reporter
+network and published under the same threshold-signature, staleness and
+deviation rules as any other price. So the recentering is checkable on-chain
+end to end, and — as the test suite asserts — a single bogus index print
+cannot lurch the band, because the index inherits the oracle's own per-update
+deviation guardrail. An index asset must itself have `anchorBand` unset;
+binding an index to a band would be circular.
+
+Beta is estimated by OLS against log returns (`offchain/src/comps/beta.ts`),
+which reports **r-squared alongside the point estimate**. This matters: a
+comparables basket that does not actually explain the asset's moves will still
+produce a confident-looking beta, and the fit quality is the only thing that
+says not to lean on it.
+
+Failure is soft in one specific place. If the index has never been published,
+or the anchor predates comps tracking, the adjustment falls back to neutral
+rather than reverting — because `checkBand` is called inside `updatePrice`, so
+reverting would freeze the asset's price entirely rather than merely
+un-tracking comps.
+
 ### Enforced on-chain, not merely respected off-chain
 
 `AnchorRegistry` implements `IAnchorBand`, a deliberately minimal veto
@@ -480,7 +532,9 @@ evidence goes stale the market's own opinion should count for more.
 | Inventing a pre-IPO valuation | Anchors are threshold-attested with a source-document hash; the guardian override cannot bypass the band |
 | Applying a preferred round price as common | Anchors carry a share class, and the registry rejects a mismatch |
 | Backdating evidence to move the band | Anchors are ordered by effective date; an older event cannot overwrite newer evidence |
-| A stale anchor pinning price to a dead valuation | Band widens with anchor age, capped so it never opens indefinitely |
+| A stale anchor pinning price to a dead valuation | Band widens with anchor age, and travels with public comparables; both capped |
+| Forging a comparables move to shift the band | The index is an ordinary oracle asset: threshold-signed, staleness-checked, and subject to its own per-update deviation guardrail |
+| Rebasing the comps origin to move the center | `compIndexAtEffective` is fixed in the signed anchor attestation |
 
 ## Known simplifications and next steps
 
@@ -528,11 +582,24 @@ deliberate simplifications:
   (uniform seniority, 1x non-participating) and a good approximation for
   layered ones, but not a general solver for pathological structures with
   interacting seniority tiers and participation caps.
-- **No sector/comparables beta.** Between anchors the price drifts and
-  responds to order flow, but does not track a public comparables index. A
-  pre-IPO software company should probably move somewhat with its listed
-  peers; wiring a comparables feed into the drift is a natural next step and
-  would slot in beside the anchor pull.
+- **Beta and the comparable set are inputs, not outputs.** The comps machinery
+  is only as good as the basket and the beta fed into it, and choosing those
+  well is the actual hard problem — an empirical one this repo does not
+  settle. `demo:comps` is explicitly circular about this: it defines fair
+  value as 1.3x the sector and configures beta at 1.3, so it demonstrates the
+  *mechanism* converges, not that any particular beta is right.
+- **Beta is static once configured.** Real betas drift, and a company's
+  sensitivity to its sector typically falls as it matures. Re-estimating and
+  updating `betaBps` is a governance action here, with no automatic
+  recalibration.
+- **The comps index needs a price feed for public equities**, which runs into
+  the same licensing wall described in the feeds section. A crypto-native
+  private company is the case that works end to end today, since its
+  comparables are assets the existing exchange feed already covers.
+- **No fundamentals between anchors.** Comps capture sector multiple
+  rerating; they cannot see this company's own execution. A missed year or a
+  breakout quarter is invisible until the next anchor lands, which is why the
+  band still widens with age and why comps alone are capped.
 - **No volume weighting.** Aggregation treats a venue with $1bn of depth and
   one with $1m identically. Volume- or depth-weighting the median would make
   it meaningfully harder to influence, at the cost of trusting each venue's
