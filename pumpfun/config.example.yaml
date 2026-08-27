@@ -1,0 +1,99 @@
+# Copy to config.yaml and edit. config.yaml is gitignored; this template is
+# not. Environment variables (PUMPBOT_*) override anything set here.
+#
+# Validate without starting anything:  make check-config
+
+mode: dry-run              # dry-run | live  -- live also needs a CLI flag
+
+grok:
+  api_key: xai-your-key-here
+  base_url: https://api.x.ai/v1
+  fast_model: grok-4-fast  # auditor, narrative, timing
+  checker_model: grok-4    # the adversarial check, on the stronger model
+  timeout_seconds: 30
+  max_retries: 3
+
+data:
+  api_key: your-data-provider-key
+  rest_url: https://data.solanatracker.io
+  ws_url: wss://datastream.solanatracker.io
+  request_timeout: 10
+
+solana:
+  rpc_url: https://api.mainnet-beta.solana.com
+  wallet_private_key: your-wallet-private-key   # base58, or a JSON byte array
+  builder: local           # local: build the instruction here (see
+                           # src/chain/pumpfun.py). remote: ask a builder
+                           # service for an unsigned tx and sign it locally.
+  remote_builder_url: https://pumpportal.fun/api/trade-local
+  slippage_bps: 1000       # 10%. Enforced by the program itself.
+  priority_fee_microlamports: 200000
+  compute_unit_limit: 250000
+  confirm_timeout_seconds: 45
+  simulate_before_send: true   # leave on: a malformed tx then costs nothing
+  max_wallet_spend_sol: 0.25   # hard ceiling per transaction, independent
+                               # of the risk manager below
+  jito:
+    enabled: false
+    block_engine_url: https://mainnet.block-engine.jito.wtf
+    tip_lamports: 100000
+
+filter:                    # stage 1 and the stage 2 vetoes
+  min_unique_buyers: 5
+  max_curve_pct: 40
+  min_age_minutes: 2
+  require_metadata: true
+  max_risk_score: 7        # provider risk score, 1-10, higher is worse
+  max_creator_hold_pct: 25 # unconditional veto, not a scored input
+  max_top5_hold_pct: 80    # unconditional veto
+  min_total_score: 0.6     # below this, no checker call and no trade
+
+scoring:
+  weights:                 # normalised, so proportions are what matter
+    audit: 0.30
+    narrative: 0.25
+    timing: 0.15
+    metrics: 0.30
+  timing_cache_seconds: 900
+
+risk:
+  max_sol_per_trade: 0.05
+  daily_loss_limit_sol: 0.5
+  max_trades_per_day: 10
+  max_open_positions: 3
+  # Exit rules, applied in this order of priority. 0 disables one.
+  stop_loss_pct: 50
+  take_profit_pct: 100
+  trailing_stop_pct: 30
+  max_hold_seconds: 3600
+  stop_loss_poll_seconds: 5
+
+reputation:
+  enabled: true
+  rug_loss_pct: 60          # a close worse than this counts as a rug
+  block_creator_after_rugs: 2
+  one_position_per_creator: true
+  forget_creators_after_days: 30   # clean addresses only; rugs are kept
+  path: state/creators.json
+
+ops:
+  grok_rate_limit_per_minute: 60
+  grok_daily_call_budget: 2000
+  breaker_failures: 5
+  breaker_cooldown_seconds: 300
+  health_port: 0            # >0 serves /healthz and /metrics
+  heartbeat_seconds: 60
+  shutdown_grace_seconds: 20
+
+alerts:
+  webhook_url: ""           # empty disables notifications
+  min_interval_seconds: 5
+
+logging:
+  path: logs/trades.jsonl
+  level: INFO
+  max_bytes: 52428800
+  backups: 5
+
+state:
+  path: state/pipeline.json

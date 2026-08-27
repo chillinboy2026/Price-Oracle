@@ -26,6 +26,9 @@ offchain/    TypeScript: fair-price engine, multi-exchange live feed,
              cap-table/waterfall math, anchor book, comparables basket +
              beta estimation, EIP-712 signers, reporter-node simulation,
              on-chain publisher
+pumpfun/     Python: a separate, self-contained project -- an agent-scored
+             pump.fun trading pipeline (see pumpfun/README.md). Unrelated to
+             the oracle above; it shares the repo, not the codebase.
 docs/        Architecture write-up
 ```
 
