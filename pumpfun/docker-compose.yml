@@ -1,0 +1,16 @@
+services:
+  pipeline:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./config:/app/config:ro
+      - ./logs:/app/logs
+      - ./state:/app/state
+    # Uncomment together with ops.health_port to expose health checks.
+    # ports:
+    #   - "8080:8080"
+    # healthcheck:
+    #   test: ["CMD", "python", "-c",
+    #          "import urllib.request;urllib.request.urlopen('http://localhost:8080/healthz')"]
+    #   interval: 30s

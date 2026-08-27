@@ -1,0 +1,48 @@
+name: pumpfun
+
+on:
+  push:
+    paths: ["pumpfun/**", ".github/workflows/pumpfun.yml"]
+  pull_request:
+    paths: ["pumpfun/**", ".github/workflows/pumpfun.yml"]
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    defaults:
+      run:
+        working-directory: pumpfun
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: pumpfun/requirements-dev.txt
+      - run: pip install -r requirements-dev.txt
+      - run: ruff check src tests scripts
+      - run: mypy src
+      - run: pytest -q
+
+  config-template-must-not-start:
+    # The shipped template carries placeholders. If it ever validates, the
+    # startup guard that stops an unconfigured run has regressed.
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: pumpfun
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - run: |
+          if python -m src.pipeline --config config.example.yaml --check; then
+            echo "config.example.yaml validated -- the placeholder guard is broken"
+            exit 1
+          fi

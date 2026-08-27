@@ -1,0 +1,28 @@
+[project]
+name = "grok-pumpfun-pipeline"
+version = "1.0.0"
+description = "Agent-scored pump.fun trading pipeline"
+requires-python = ">=3.11"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+filterwarnings = ["error::RuntimeWarning"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "C4", "SIM", "RET", "PLC0415"]
+ignore = ["E501", "B008", "SIM108"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["PLC0415"]
+"src/executor.py" = ["PLC0415"]
+"src/pipeline.py" = ["PLC0415"]
+
+[tool.mypy]
+python_version = "3.11"
+warn_unused_ignores = false
+ignore_missing_imports = true
