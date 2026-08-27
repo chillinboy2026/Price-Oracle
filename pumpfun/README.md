@@ -258,6 +258,44 @@ loading errors deliberately never echo the value.
 are startup errors with a list, not a surprise an hour into trading. A silently
 ignored typo is a disabled limit.
 
+## Alerts
+
+Set `alerts.format` and the pipeline notifies you on startup/shutdown, every
+buy, every close (with PnL and exit reason), a creator rug, an opened circuit
+breaker, and a stalled launch stream. **This works in dry-run** — a dry-run
+buy is exactly the "good token picked up" signal, with no wallet involved.
+
+| format | destination | needs |
+|---|---|---|
+| `generic` | your own receiver | `webhook_url` (full JSON payload) |
+| `slack` | Slack incoming webhook | `webhook_url` |
+| `discord` | Discord webhook | `webhook_url` |
+| `telegram` | Telegram Bot API | `telegram_bot_token` + `telegram_chat_id` |
+
+Telegram setup, once:
+
+1. Message [@BotFather](https://t.me/BotFather), send `/newbot`, follow the
+   prompts. It replies with the bot token (`123456:ABC-...`).
+2. Open a chat with your new bot and send it any message (a bot cannot
+   message you first).
+3. Get your chat id: visit
+   `https://api.telegram.org/bot<TOKEN>/getUpdates` in a browser and read
+   `message.chat.id` from the reply, or ask [@userinfobot](https://t.me/userinfobot).
+4. Configure — env vars keep the token out of the file:
+
+```bash
+export PUMPBOT_ALERT_FORMAT=telegram
+export PUMPBOT_TELEGRAM_BOT_TOKEN=123456:ABC-...
+export PUMPBOT_TELEGRAM_CHAT_ID=987654321
+make run
+```
+
+An explicitly chosen format with missing credentials is a startup error, not
+a silent no-alerts run. Sends are rate-limited, persistent conditions report
+on the transition rather than every tick, and a failed send never touches
+trading. The httpx request logger is capped at WARNING process-wide, because
+its per-request INFO line includes the full URL and alert URLs embed tokens.
+
 ## Logging
 
 JSONL, one record per line: `buy`, `skip`, `close`. Every `buy` stores the

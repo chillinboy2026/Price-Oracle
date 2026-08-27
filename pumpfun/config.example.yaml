@@ -86,7 +86,10 @@ ops:
   shutdown_grace_seconds: 20
 
 alerts:
-  webhook_url: ""           # empty disables notifications
+  format: generic           # generic | slack | discord | telegram
+  webhook_url: ""           # generic/slack/discord; empty disables alerts
+  telegram_bot_token: ""    # telegram only: from @BotFather
+  telegram_chat_id: ""      # telegram only: your chat or group id
   min_interval_seconds: 5
 
 logging:

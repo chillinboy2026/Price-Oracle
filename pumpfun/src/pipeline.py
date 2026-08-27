@@ -114,6 +114,9 @@ class PumpFunPipeline:
         self.alerter = Alerter(
             config.alerts.webhook_url.get_secret_value(),
             config.alerts.min_interval_seconds,
+            fmt=config.alerts.format,
+            telegram_bot_token=config.alerts.telegram_bot_token.get_secret_value(),
+            telegram_chat_id=config.alerts.telegram_chat_id,
         )
 
         self.grok: GrokClient | None = None

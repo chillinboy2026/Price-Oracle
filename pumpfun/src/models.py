@@ -460,7 +460,13 @@ class OpsConfig(BaseModel):
 class AlertsConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    # generic posts the full JSON payload to webhook_url; slack and discord
+    # reshape it for their incoming webhooks; telegram ignores webhook_url
+    # and calls the Bot API with telegram_bot_token + telegram_chat_id.
+    format: Literal["generic", "slack", "discord", "telegram"] = "generic"
     webhook_url: SecretStr = SecretStr("")
+    telegram_bot_token: SecretStr = SecretStr("")
+    telegram_chat_id: str = ""
     min_interval_seconds: float = Field(default=5.0, ge=0)
 
 
@@ -549,6 +555,22 @@ class Config(BaseModel):
                 "risk.max_sol_per_trade exceeds risk.daily_loss_limit_sol: "
                 "a single trade could blow the daily limit"
             )
+        # An explicitly chosen alert destination with no credentials is the
+        # "surprise an hour later" class of mistake: you believe you will
+        # be told about buys, and you will not. The default (generic with
+        # no webhook) simply means alerts are off, which is fine.
+        if self.alerts.format == "telegram":
+            if not (self.alerts.telegram_bot_token.get_secret_value()
+                    and self.alerts.telegram_chat_id):
+                found.append(
+                    "alerts.format is telegram but telegram_bot_token and/or "
+                    "telegram_chat_id is unset"
+                )
+        elif self.alerts.format in ("slack", "discord") and \
+                not self.alerts.webhook_url.get_secret_value():
+            found.append(
+                f"alerts.format is {self.alerts.format} but alerts.webhook_url is unset"
+            )
         return found
 
     def warnings(self) -> list[str]:
@@ -608,6 +630,9 @@ ENV_MAP: dict[str, tuple[str, ...]] = {
     "STATE_PATH": ("state", "path"),
     "HEALTH_PORT": ("ops", "health_port"),
     "ALERT_WEBHOOK": ("alerts", "webhook_url"),
+    "ALERT_FORMAT": ("alerts", "format"),
+    "TELEGRAM_BOT_TOKEN": ("alerts", "telegram_bot_token"),
+    "TELEGRAM_CHAT_ID": ("alerts", "telegram_chat_id"),
 }
 
 
